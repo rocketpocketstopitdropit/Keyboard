@@ -20,7 +20,7 @@ class SetupActivity : Activity() {
             setPadding(48, 48, 48, 48)
         }
 
-        val text = TextView(this).apply {
+        val instructionsText = TextView(this).apply {
             text = "Step 1: Enable this keyboard in system settings.\n\n" +
                     "Step 2: Switch to it from the keyboard picker.\n\n" +
                     "You only need to do this once."
@@ -42,7 +42,7 @@ class SetupActivity : Activity() {
             }
         }
 
-        layout.addView(text)
+        layout.addView(instructionsText)
         layout.addView(enableButton)
         layout.addView(switchButton)
         setContentView(layout)
