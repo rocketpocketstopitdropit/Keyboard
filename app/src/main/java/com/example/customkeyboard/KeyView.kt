@@ -3,6 +3,7 @@ package com.example.customkeyboard
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Rect
+import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -20,24 +21,23 @@ class KeyView(
     companion object {
         const val FLICK_THRESHOLD_DP = 18
         const val PREDICTED_EXPAND_DP = 20
+        const val CORNER_RADIUS_DP = 12
+        const val GRADIENT_RADIUS_DP = 90
     }
 
     private val centerLabel: TextView
     private val flickThresholdPx: Float
     private val expandPx: Int
 
+    private val restDrawable: GradientDrawable
+    private val pressedDrawable: GradientDrawable
+
+    private var isPressedIn = false
+
     var isPredicted: Boolean = false
         set(value) {
             field = value
-            setBackgroundColor(
-                context.getColor(
-                    when {
-                        value -> R.color.key_pressed
-                        config.action != KeyAction.CHAR -> R.color.key_background_special
-                        else -> R.color.key_background
-                    }
-                )
-            )
+            updateBackground()
         }
 
     var displayLabel: String = config.label
@@ -47,19 +47,39 @@ class KeyView(
         }
 
     init {
-        flickThresholdPx = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP, FLICK_THRESHOLD_DP.toFloat(), resources.displayMetrics
-        )
-        expandPx = TypedValue.applyDimension(
-            TypedValue.COMPLEX_UNIT_DIP, PREDICTED_EXPAND_DP.toFloat(), resources.displayMetrics
-        ).toInt()
+        val dm = resources.displayMetrics
+        fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), dm)
 
-        setBackgroundColor(
-            context.getColor(
-                if (config.action != KeyAction.CHAR) R.color.key_background_special
-                else R.color.key_background
-            )
-        )
+        flickThresholdPx = dp(FLICK_THRESHOLD_DP)
+        expandPx = dp(PREDICTED_EXPAND_DP).toInt()
+
+        val baseColorRes = if (config.action != KeyAction.CHAR) R.color.key_background_special
+        else R.color.key_background
+        val light = context.getColor(R.color.key_light)
+        val mid = context.getColor(baseColorRes)
+        val dark = context.getColor(R.color.key_dark)
+        val cornerPx = dp(CORNER_RADIUS_DP)
+        val gradientPx = dp(GRADIENT_RADIUS_DP)
+
+        restDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = cornerPx
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = gradientPx
+            setColors(intArrayOf(light, mid, dark))
+            setGradientCenter(0.32f, 0.28f)
+        }
+
+        pressedDrawable = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = cornerPx
+            gradientType = GradientDrawable.RADIAL_GRADIENT
+            gradientRadius = gradientPx
+            setColors(intArrayOf(dark, mid, light))
+            setGradientCenter(0.68f, 0.72f)
+        }
+
+        background = restDrawable
 
         centerLabel = TextView(context).apply {
             text = config.label
@@ -95,6 +115,14 @@ class KeyView(
         addView(tv)
     }
 
+    private fun updateBackground() {
+        if (isPredicted) {
+            setBackgroundColor(context.getColor(R.color.key_pressed))
+            return
+        }
+        background = if (isPressedIn) pressedDrawable else restDrawable
+    }
+
     fun localHitRect(): Rect {
         val r = Rect(left, top, right, bottom)
         if (isPredicted) r.inset(-expandPx, -expandPx)
@@ -109,11 +137,12 @@ class KeyView(
     }
 
     fun setPressedVisual(pressed: Boolean) {
-        isPressed = pressed
+        isPressedIn = pressed
+        updateBackground()
     }
 
     fun resolveGesture(dx: Float, dy: Float) {
-        isPressed = false
+        setPressedVisual(false)
         val distance = sqrt(dx * dx + dy * dy)
         if (distance < flickThresholdPx) {
             onTap(config)
