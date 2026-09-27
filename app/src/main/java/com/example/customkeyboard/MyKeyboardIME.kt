@@ -1,6 +1,9 @@
 package com.example.customkeyboard
 
 import android.inputmethodservice.InputMethodService
+import android.os.Build
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.util.TypedValue
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -8,6 +11,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.LinearLayout
+import kotlin.math.abs
 
 class MyKeyboardIME : InputMethodService() {
 
@@ -35,7 +39,13 @@ class MyKeyboardIME : InputMethodService() {
         predictedKeyView = null
         activeKeyView = null
 
-        for (row in KeyboardLayout.ROWS) {
+        val keyHeight = KeyboardPrefs.getKeyHeight(this)
+        val keySpacing = KeyboardPrefs.getKeySpacing(this)
+        val showHints = KeyboardPrefs.getShowHints(this)
+        val showHighlight = KeyboardPrefs.getShowPredictedHighlight(this)
+        val showNumberRow = KeyboardPrefs.getShowNumberRow(this)
+
+        fun buildRow(rowConfigs: List<KeyConfig>) {
             val rowLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 layoutParams = LinearLayout.LayoutParams(
@@ -43,17 +53,18 @@ class MyKeyboardIME : InputMethodService() {
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { topMargin = dp(3); bottomMargin = dp(3) }
             }
-
-            for (keyConfig in row) {
+            for (keyConfig in rowConfigs) {
                 val keyView = KeyView(
                     context = this,
                     config = keyConfig,
                     onTap = { cfg -> handleTap(cfg) },
-                    onFlick = { _, alt -> commitDirect(alt) }
+                    onFlick = { _, alt -> commitDirect(alt) },
+                    showHints = showHints,
+                    showPredictedHighlight = showHighlight
                 ).apply {
                     layoutParams = LinearLayout.LayoutParams(
-                        0, dp(KeyboardLayout.KEY_HEIGHT_DP), keyConfig.weight
-                    ).apply { marginStart = dp(2); marginEnd = dp(2) }
+                        0, dp(keyHeight), keyConfig.weight
+                    ).apply { marginStart = dp(keySpacing); marginEnd = dp(keySpacing) }
                 }
                 rowLayout.addView(keyView)
                 allKeys.add(keyView)
@@ -67,6 +78,15 @@ class MyKeyboardIME : InputMethodService() {
             root.addView(rowLayout)
         }
 
+        if (showNumberRow) buildRow(KeyboardLayout.NUMBER_ROW)
+
+        KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
+            val effectiveRow = row.mapIndexed { colIndex, defaultConfig ->
+                KeyLayoutStore.effectiveConfig(this, rowIndex, colIndex, defaultConfig)
+            }
+            buildRow(effectiveRow)
+        }
+
         root.setOnTouchListener { _, event -> handleTouch(event) }
         return root
     }
@@ -77,13 +97,24 @@ class MyKeyboardIME : InputMethodService() {
                 downX = event.x
                 downY = event.y
                 activeKeyView = resolveKeyAt(event.x.toInt(), event.y.toInt())
-                activeKeyView?.setPressedVisual(true)
+                activeKeyView?.let {
+                    it.setPressedVisual(true)
+                    vibrateKey()
+                }
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 val target = activeKeyView
                 activeKeyView = null
-                target?.resolveGesture(event.x - downX, event.y - downY)
+                val dx = event.x - downX
+                val dy = event.y - downY
+                if (target != null && target.config.action == KeyAction.SPACE &&
+                    abs(dx) > abs(dy) && handleSpaceSwipe(dx)
+                ) {
+                    target.setPressedVisual(false)
+                } else {
+                    target?.resolveGesture(dx, dy)
+                }
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
@@ -93,6 +124,17 @@ class MyKeyboardIME : InputMethodService() {
             }
         }
         return false
+    }
+
+    private fun handleSpaceSwipe(dx: Float): Boolean {
+        val thresholdPx = dp(30).toFloat()
+        if (abs(dx) < thresholdPx) return false
+        val ic = currentInputConnection ?: return false
+        val keyCode = if (dx > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
+        ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
+        ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+        pendingCorrection = null
+        return true
     }
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
@@ -204,6 +246,20 @@ class MyKeyboardIME : InputMethodService() {
         predictedKeyView = null
         for (keyView in letterKeys) {
             keyView.displayLabel = keyView.displayLabel.lowercase()
+        }
+    }
+
+    private fun vibrateKey() {
+        val intensity = KeyboardPrefs.getHapticIntensity(this)
+        if (intensity <= 0) return
+        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator ?: return
+        val durationMs = 12L
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val amplitude = ((intensity / 100f) * 255).toInt().coerceIn(1, 255)
+            vibrator.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(durationMs)
         }
     }
 
