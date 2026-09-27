@@ -4,4 +4,6 @@
     <color name="key_background_special">#3A3A3A</color>
     <color name="key_text">#FFFFFF</color>
     <color name="key_pressed">#4A4A4A</color>
+    <color name="key_light">#5A5A5A</color>
+    <color name="key_dark">#161616</color>
 </resources>
