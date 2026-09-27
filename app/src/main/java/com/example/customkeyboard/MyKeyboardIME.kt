@@ -21,6 +21,7 @@ class MyKeyboardIME : InputMethodService() {
     private var downY = 0f
 
     private val currentWord = StringBuilder()
+    private var pendingCorrection: Pair<String, String>? = null
 
     override fun onCreateInputView(): View {
         val root = LinearLayout(this).apply {
@@ -103,11 +104,27 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun handleTap(config: KeyConfig) {
         val ic = currentInputConnection ?: return
-        when (config.action) {
-            KeyAction.BACKSPACE -> {
+
+        if (config.action == KeyAction.BACKSPACE) {
+            val pending = pendingCorrection
+            pendingCorrection = null
+            if (pending != null) {
+                val (original, corrected) = pending
+                ic.deleteSurroundingText(corrected.length + 1, 0)
+                ic.commitText(original, 1)
+                currentWord.clear()
+                currentWord.append(original)
+            } else {
                 ic.deleteSurroundingText(1, 0)
                 if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
             }
+            updatePrediction()
+            return
+        }
+
+        pendingCorrection = null
+
+        when (config.action) {
             KeyAction.ENTER -> {
                 ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
                 currentWord.clear()
@@ -120,7 +137,16 @@ class MyKeyboardIME : InputMethodService() {
             KeyAction.SYMBOLS -> {
             }
             KeyAction.SPACE -> {
-                ic.commitText(" ", 1)
+                val typed = currentWord.toString()
+                val correction = Autocorrector.correctionFor(typed)
+                if (correction != null) {
+                    ic.deleteSurroundingText(typed.length, 0)
+                    ic.commitText(correction, 1)
+                    ic.commitText(" ", 1)
+                    pendingCorrection = typed to correction
+                } else {
+                    ic.commitText(" ", 1)
+                }
                 currentWord.clear()
             }
             KeyAction.CHAR -> {
@@ -134,6 +160,7 @@ class MyKeyboardIME : InputMethodService() {
                     currentWord.clear()
                 }
             }
+            KeyAction.BACKSPACE -> {}
         }
         updatePrediction()
     }
@@ -141,6 +168,7 @@ class MyKeyboardIME : InputMethodService() {
     private fun commitDirect(text: String) {
         currentInputConnection?.commitText(text, 1)
         currentWord.clear()
+        pendingCorrection = null
         updatePrediction()
     }
 
@@ -171,6 +199,7 @@ class MyKeyboardIME : InputMethodService() {
         super.onStartInputView(info, restarting)
         capsOn = false
         currentWord.clear()
+        pendingCorrection = null
         predictedKeyView?.isPredicted = false
         predictedKeyView = null
         for (keyView in letterKeys) {
