@@ -7,7 +7,8 @@ data class KeyConfig(
     val bottomLeft: String? = null,
     val bottomRight: String? = null,
     val weight: Float = 1f,
-    val action: KeyAction = KeyAction.CHAR
+    val action: KeyAction = KeyAction.CHAR,
+    val colorHex: String? = null
 )
 
 enum class KeyAction { CHAR, SHIFT, BACKSPACE, ENTER, SPACE, SYMBOLS }
@@ -15,6 +16,11 @@ enum class KeyAction { CHAR, SHIFT, BACKSPACE, ENTER, SPACE, SYMBOLS }
 object KeyboardLayout {
 
     const val KEY_HEIGHT_DP = 52
+
+    val NUMBER_ROW: List<KeyConfig> = listOf(
+        KeyConfig("1"), KeyConfig("2"), KeyConfig("3"), KeyConfig("4"), KeyConfig("5"),
+        KeyConfig("6"), KeyConfig("7"), KeyConfig("8"), KeyConfig("9"), KeyConfig("0")
+    )
 
     val ROWS: List<List<KeyConfig>> = listOf(
         listOf(
