@@ -27,6 +27,9 @@ object LetterPredictor {
     fun predictNext(wordSoFar: String): Char? {
         if (wordSoFar.isEmpty()) return null
         val lower = wordSoFar.lowercase()
+
+        WordPredictor.predictNextChar(lower)?.let { return it }
+
         if (lower.length >= 2) {
             trigramMap[lower.takeLast(2)]?.let { return it }
         }
