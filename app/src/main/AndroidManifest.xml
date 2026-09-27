@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <uses-permission android:name="android.permission.VIBRATE" />
+
     <application
         android:allowBackup="true"
         android:icon="@android:drawable/ic_menu_edit"
@@ -15,6 +17,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="false"
+            android:label="Keyboard Settings" />
+
+        <activity
+            android:name=".KeyEditorActivity"
+            android:exported="false"
+            android:label="Edit Keys" />
 
         <service
             android:name=".MyKeyboardIME"
