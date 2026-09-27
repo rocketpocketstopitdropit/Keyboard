@@ -15,7 +15,9 @@ class KeyView(
     context: Context,
     val config: KeyConfig,
     private val onTap: (KeyConfig) -> Unit,
-    private val onFlick: (KeyConfig, String) -> Unit
+    private val onFlick: (KeyConfig, String) -> Unit,
+    private val showHints: Boolean = true,
+    private val showPredictedHighlight: Boolean = true
 ) : FrameLayout(context) {
 
     companion object {
@@ -53,11 +55,20 @@ class KeyView(
         flickThresholdPx = dp(FLICK_THRESHOLD_DP)
         expandPx = dp(PREDICTED_EXPAND_DP).toInt()
 
-        val baseColorRes = if (config.action != KeyAction.CHAR) R.color.key_background_special
-        else R.color.key_background
-        val light = context.getColor(R.color.key_light)
-        val mid = context.getColor(baseColorRes)
-        val dark = context.getColor(R.color.key_dark)
+        val mid: Int
+        val light: Int
+        val dark: Int
+        if (config.colorHex != null) {
+            mid = Color.parseColor(config.colorHex)
+            light = blend(mid, Color.WHITE, 0.35f)
+            dark = blend(mid, Color.BLACK, 0.45f)
+        } else {
+            val baseColorRes = if (config.action != KeyAction.CHAR) R.color.key_background_special
+            else R.color.key_background
+            mid = context.getColor(baseColorRes)
+            light = context.getColor(R.color.key_light)
+            dark = context.getColor(R.color.key_dark)
+        }
         val cornerPx = dp(CORNER_RADIUS_DP)
         val gradientPx = dp(GRADIENT_RADIUS_DP)
 
@@ -90,10 +101,19 @@ class KeyView(
         }
         addView(centerLabel)
 
-        addCornerHint(config.topLeft, Gravity.TOP or Gravity.START)
-        addCornerHint(config.topRight, Gravity.TOP or Gravity.END)
-        addCornerHint(config.bottomLeft, Gravity.BOTTOM or Gravity.START)
-        addCornerHint(config.bottomRight, Gravity.BOTTOM or Gravity.END)
+        if (showHints) {
+            addCornerHint(config.topLeft, Gravity.TOP or Gravity.START)
+            addCornerHint(config.topRight, Gravity.TOP or Gravity.END)
+            addCornerHint(config.bottomLeft, Gravity.BOTTOM or Gravity.START)
+            addCornerHint(config.bottomRight, Gravity.BOTTOM or Gravity.END)
+        }
+    }
+
+    private fun blend(color: Int, target: Int, ratio: Float): Int {
+        val r = (Color.red(color) * (1 - ratio) + Color.red(target) * ratio).toInt()
+        val g = (Color.green(color) * (1 - ratio) + Color.green(target) * ratio).toInt()
+        val b = (Color.blue(color) * (1 - ratio) + Color.blue(target) * ratio).toInt()
+        return Color.rgb(r, g, b)
     }
 
     private fun addCornerHint(text: String?, gravity: Int) {
@@ -116,7 +136,7 @@ class KeyView(
     }
 
     private fun updateBackground() {
-        if (isPredicted) {
+        if (isPredicted && showPredictedHighlight) {
             setBackgroundColor(context.getColor(R.color.key_pressed))
             return
         }
