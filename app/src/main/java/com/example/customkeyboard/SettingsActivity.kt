@@ -113,7 +113,6 @@ class SettingsActivity : Activity() {
             }
         })
 
-        // Note at the bottom
         root.addView(TextView(this).apply {
             text = "\nChanges take effect the next time the keyboard is shown."
             textSize = 12f
@@ -124,3 +123,4 @@ class SettingsActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
     }
 }
+
