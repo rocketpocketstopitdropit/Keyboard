@@ -21,6 +21,14 @@ object KeyboardLayout {
     const val KEY_HEIGHT_DP = 52
 
     private fun plain(vararg labels: String): List<KeyConfig> = labels.map { KeyConfig(it) }
+    private fun plainW(weight: Float, vararg labels: String): List<KeyConfig> =
+        labels.map { KeyConfig(it, weight = weight) }
+
+    // The backspace key that sits in the notch above the top-right of the keyboard.
+    val NOTCH_KEY = KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
+
+    /** The built-in key at this position. row = -1 is the notch key. */
+    fun defaultFor(row: Int, col: Int): KeyConfig = if (row < 0) NOTCH_KEY else ROWS[row][col]
 
     // Optional row above the letters. Shows these symbols while Shift is on.
     val NUMBER_ROW: List<KeyConfig> = listOf(
@@ -35,9 +43,8 @@ object KeyboardLayout {
     val SYMBOLS_1: List<List<KeyConfig>> = listOf(
         plain("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
         plain("-", "/", ":", ";", "(", ")", "\$", "&", "@", "\""),
-        listOf(KeyConfig("=\\<", weight = 1.5f, action = KeyAction.SYMBOLS_ALT)) +
-                plain(".", ",", "?", "!", "'") +
-                listOf(KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)),
+        listOf(KeyConfig("=\\<", weight = 2f, action = KeyAction.SYMBOLS_ALT)) +
+                plainW(1.6f, ".", ",", "?", "!", "'"),
         listOf(
             KeyConfig("ABC", weight = 1.5f, action = KeyAction.LETTERS),
             KeyConfig(" ", weight = 5f, action = KeyAction.SPACE),
@@ -49,9 +56,8 @@ object KeyboardLayout {
     val SYMBOLS_2: List<List<KeyConfig>> = listOf(
         plain("[", "]", "{", "}", "#", "%", "^", "*", "+", "="),
         plain("_", "\\", "|", "~", "<", ">", "€", "£", "¥", "•"),
-        listOf(KeyConfig("123", weight = 1.5f, action = KeyAction.SYMBOLS)) +
-                plain(".", ",", "?", "!", "'") +
-                listOf(KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)),
+        listOf(KeyConfig("123", weight = 2f, action = KeyAction.SYMBOLS)) +
+                plainW(1.6f, ".", ",", "?", "!", "'"),
         listOf(
             KeyConfig("ABC", weight = 1.5f, action = KeyAction.LETTERS),
             KeyConfig(" ", weight = 5f, action = KeyAction.SPACE),
@@ -76,9 +82,10 @@ object KeyboardLayout {
         ),
         listOf(
             KeyConfig("⇧", weight = 1.5f, action = KeyAction.SHIFT),
-            KeyConfig("z"), KeyConfig("x"), KeyConfig("c"), KeyConfig("v"),
-            KeyConfig("b"), KeyConfig("n"), KeyConfig("m"),
-            KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
+            KeyConfig("z", weight = 1.2f), KeyConfig("x", weight = 1.2f),
+            KeyConfig("c", weight = 1.2f), KeyConfig("v", weight = 1.2f),
+            KeyConfig("b", weight = 1.2f), KeyConfig("n", weight = 1.2f),
+            KeyConfig("m", weight = 1.2f)
         ),
         listOf(
             KeyConfig("123", weight = 1.5f, action = KeyAction.SYMBOLS),
