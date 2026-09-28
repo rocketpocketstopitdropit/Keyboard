@@ -2,6 +2,9 @@ package com.example.customkeyboard
 
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.TypedValue
@@ -15,7 +18,14 @@ import kotlin.math.abs
 
 class MyKeyboardIME : InputMethodService() {
 
-    private var capsOn = false
+    private enum class Page { LETTERS, SYMBOLS_1, SYMBOLS_2 }
+    private enum class ShiftState { OFF, ONCE, LOCKED }
+
+    private var page = Page.LETTERS
+    private var shiftState = ShiftState.OFF
+    private var lastShiftTapTime = 0L
+
+    private lateinit var keyboardRoot: LinearLayout
     private val letterKeys = mutableListOf<KeyView>()
     private val allKeys = mutableListOf<KeyView>()
 
@@ -27,13 +37,29 @@ class MyKeyboardIME : InputMethodService() {
     private val currentWord = StringBuilder()
     private var pendingCorrection: Pair<String, String>? = null
 
+    // Hold-to-repeat (backspace) and space-bar slide state.
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private var repeatRunnable: Runnable? = null
+    private var backspaceHeld = false
+    private var spaceSlideActive = false
+    private var spaceSlideDir = 0
+    private var lastScrubX = 0f
+
     override fun onCreateInputView(): View {
-        val root = LinearLayout(this).apply {
+        keyboardRoot = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(getColor(R.color.keyboard_background))
             setPadding(dp(4), dp(6), dp(4), dp(6))
         }
+        keyboardRoot.setOnTouchListener { _, event -> handleTouch(event) }
+        populateKeyboard()
+        return keyboardRoot
+    }
 
+    /** Rebuilds every key for the current page. Also re-reads settings and key edits. */
+    private fun populateKeyboard() {
+        stopRepeating()
+        keyboardRoot.removeAllViews()
         letterKeys.clear()
         allKeys.clear()
         predictedKeyView = null
@@ -75,66 +101,168 @@ class MyKeyboardIME : InputMethodService() {
                     letterKeys.add(keyView)
                 }
             }
-            root.addView(rowLayout)
+            keyboardRoot.addView(rowLayout)
         }
 
-        if (showNumberRow) buildRow(KeyboardLayout.NUMBER_ROW)
-
-        KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
-            val effectiveRow = row.mapIndexed { colIndex, defaultConfig ->
-                KeyLayoutStore.effectiveConfig(this, rowIndex, colIndex, defaultConfig)
+        when (page) {
+            Page.LETTERS -> {
+                if (showNumberRow) buildRow(KeyboardLayout.NUMBER_ROW)
+                KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
+                    buildRow(row.mapIndexed { colIndex, defaultConfig ->
+                        KeyLayoutStore.effectiveConfig(this, rowIndex, colIndex, defaultConfig)
+                    })
+                }
             }
-            buildRow(effectiveRow)
+            Page.SYMBOLS_1 -> KeyboardLayout.SYMBOLS_1.forEach { buildRow(it) }
+            Page.SYMBOLS_2 -> KeyboardLayout.SYMBOLS_2.forEach { buildRow(it) }
         }
-
-        root.setOnTouchListener { _, event -> handleTouch(event) }
-        return root
+        refreshLabels()
     }
+
+    // ---------- Shift ----------
+
+    /** What a key shows and types right now, given the shift state. */
+    private fun outputFor(config: KeyConfig): String {
+        if (shiftState == ShiftState.OFF) return config.label
+        config.shiftLabel?.let { return it }
+        return if (config.label.length == 1 && config.label[0].isLetter())
+            config.label.uppercase()
+        else config.label
+    }
+
+    private fun refreshLabels() {
+        for (kv in allKeys) {
+            val cfg = kv.config
+            when (cfg.action) {
+                KeyAction.CHAR -> kv.displayLabel = outputFor(cfg)
+                KeyAction.SHIFT -> {
+                    kv.displayLabel = when (shiftState) {
+                        ShiftState.OFF -> cfg.label
+                        ShiftState.ONCE -> "⬆"
+                        ShiftState.LOCKED -> "⇪"
+                    }
+                    // Shift stays pressed-in while it's on.
+                    kv.setPressedVisual(shiftState != ShiftState.OFF)
+                }
+                else -> {}
+            }
+        }
+    }
+
+    // ---------- Touch handling ----------
 
     private fun handleTouch(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX = event.x
                 downY = event.y
-                activeKeyView = resolveKeyAt(event.x.toInt(), event.y.toInt())
-                activeKeyView?.let {
-                    it.setPressedVisual(true)
+                spaceSlideActive = false
+                spaceSlideDir = 0
+                backspaceHeld = false
+                val target = resolveKeyAt(event.x.toInt(), event.y.toInt())
+                activeKeyView = target
+                if (target != null) {
+                    target.setPressedVisual(true)
                     vibrateKey()
+                    if (target.config.action == KeyAction.BACKSPACE) {
+                        // Delete right away, then keep deleting while held.
+                        backspaceHeld = true
+                        handleTap(target.config)
+                        startRepeating(400L, 45L) { handleTap(target.config) }
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val target = activeKeyView
+                if (target != null && target.config.action == KeyAction.SPACE) {
+                    handleSpaceMove(event.x - downX, event.y - downY, event.x)
                 }
                 return true
             }
             MotionEvent.ACTION_UP -> {
                 val target = activeKeyView
                 activeKeyView = null
-                val dx = event.x - downX
-                val dy = event.y - downY
-                if (target != null && target.config.action == KeyAction.SPACE &&
-                    abs(dx) > abs(dy) && handleSpaceSwipe(dx)
-                ) {
-                    target.setPressedVisual(false)
-                } else {
-                    target?.resolveGesture(dx, dy)
+                stopRepeating()
+                when {
+                    target == null -> {}
+                    backspaceHeld -> target.setPressedVisual(false)
+                    spaceSlideActive -> target.setPressedVisual(false)
+                    else -> target.resolveGesture(event.x - downX, event.y - downY)
                 }
+                backspaceHeld = false
+                spaceSlideActive = false
+                spaceSlideDir = 0
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
+                stopRepeating()
                 activeKeyView?.setPressedVisual(false)
                 activeKeyView = null
+                backspaceHeld = false
+                spaceSlideActive = false
+                spaceSlideDir = 0
                 return true
             }
         }
         return false
     }
 
-    private fun handleSpaceSwipe(dx: Float): Boolean {
-        val thresholdPx = dp(30).toFloat()
-        if (abs(dx) < thresholdPx) return false
-        val ic = currentInputConnection ?: return false
-        val keyCode = if (dx > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
+    /**
+     * Sliding on the space bar moves the cursor. Every ~16dp of finger travel
+     * moves it one character, and holding the finger off to one side keeps
+     * moving it in that direction until you let go or slide back to the middle.
+     */
+    private fun handleSpaceMove(totalDx: Float, totalDy: Float, x: Float) {
+        val threshold = dp(24).toFloat()
+        val scrubStep = dp(16).toFloat()
+
+        if (!spaceSlideActive) {
+            if (abs(totalDx) < threshold || abs(totalDx) < abs(totalDy)) return
+            spaceSlideActive = true
+            lastScrubX = x
+            moveCursor(if (totalDx > 0) 1 else -1)
+        }
+
+        while (abs(x - lastScrubX) >= scrubStep) {
+            val stepDir = if (x > lastScrubX) 1 else -1
+            moveCursor(stepDir)
+            lastScrubX += stepDir * scrubStep
+        }
+
+        val dir = if (abs(totalDx) >= threshold) (if (totalDx > 0) 1 else -1) else 0
+        if (dir != spaceSlideDir) {
+            spaceSlideDir = dir
+            if (dir == 0) stopRepeating()
+            else startRepeating(350L, 70L) { moveCursor(spaceSlideDir) }
+        }
+    }
+
+    private fun moveCursor(dir: Int) {
+        val ic = currentInputConnection ?: return
+        val keyCode = if (dir > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+        currentWord.clear()
         pendingCorrection = null
-        return true
+        updatePrediction()
+    }
+
+    private fun startRepeating(initialDelayMs: Long, intervalMs: Long, action: () -> Unit) {
+        stopRepeating()
+        val r = object : Runnable {
+            override fun run() {
+                action()
+                uiHandler.postDelayed(this, intervalMs)
+            }
+        }
+        repeatRunnable = r
+        uiHandler.postDelayed(r, initialDelayMs)
+    }
+
+    private fun stopRepeating() {
+        repeatRunnable?.let { uiHandler.removeCallbacks(it) }
+        repeatRunnable = null
     }
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
@@ -142,6 +270,14 @@ class MyKeyboardIME : InputMethodService() {
             if (predicted.absoluteHitRect().contains(x, y)) return predicted
         }
         return allKeys.firstOrNull { it.absoluteHitRect().contains(x, y) }
+    }
+
+    // ---------- Key actions ----------
+
+    private fun matchCase(typed: String, correction: String): String = when {
+        typed.length > 1 && typed.all { it.isUpperCase() } -> correction.uppercase()
+        typed.isNotEmpty() && typed[0].isUpperCase() -> correction.replaceFirstChar { it.uppercase() }
+        else -> correction
     }
 
     private fun handleTap(config: KeyConfig) {
@@ -157,8 +293,14 @@ class MyKeyboardIME : InputMethodService() {
                 currentWord.clear()
                 currentWord.append(original)
             } else {
-                ic.deleteSurroundingText(1, 0)
-                if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
+                val selected = ic.getSelectedText(0)
+                if (!selected.isNullOrEmpty()) {
+                    ic.commitText("", 1)
+                    currentWord.clear()
+                } else {
+                    ic.deleteSurroundingText(1, 0)
+                    if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
+                }
             }
             updatePrediction()
             return
@@ -169,18 +311,44 @@ class MyKeyboardIME : InputMethodService() {
         when (config.action) {
             KeyAction.ENTER -> {
                 ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
                 currentWord.clear()
             }
             KeyAction.SHIFT -> {
-                capsOn = !capsOn
-                updateCaps()
+                // Tap once = capitalize the next letter. Tap twice quickly = caps lock.
+                val now = SystemClock.uptimeMillis()
+                shiftState = when {
+                    shiftState == ShiftState.LOCKED -> ShiftState.OFF
+                    shiftState == ShiftState.ONCE && now - lastShiftTapTime < 400L -> ShiftState.LOCKED
+                    shiftState == ShiftState.ONCE -> ShiftState.OFF
+                    else -> ShiftState.ONCE
+                }
+                lastShiftTapTime = now
+                refreshLabels()
                 return
             }
             KeyAction.SYMBOLS -> {
+                page = Page.SYMBOLS_1
+                shiftState = ShiftState.OFF
+                currentWord.clear()
+                populateKeyboard()
+                return
+            }
+            KeyAction.SYMBOLS_ALT -> {
+                page = if (page == Page.SYMBOLS_1) Page.SYMBOLS_2 else Page.SYMBOLS_1
+                currentWord.clear()
+                populateKeyboard()
+                return
+            }
+            KeyAction.LETTERS -> {
+                page = Page.LETTERS
+                currentWord.clear()
+                populateKeyboard()
+                return
             }
             KeyAction.SPACE -> {
                 val typed = currentWord.toString()
-                val correction = Autocorrector.correctionFor(typed)
+                val correction = Autocorrector.correctionFor(typed)?.let { matchCase(typed, it) }
                 if (correction != null) {
                     ic.deleteSurroundingText(typed.length, 0)
                     ic.commitText(correction, 1)
@@ -192,14 +360,16 @@ class MyKeyboardIME : InputMethodService() {
                 currentWord.clear()
             }
             KeyAction.CHAR -> {
-                val text = if (capsOn && config.label.length == 1 && config.label[0].isLetter())
-                    config.label.uppercase()
-                else config.label
+                val text = outputFor(config)
                 ic.commitText(text, 1)
-                if (config.label.length == 1 && config.label[0].isLetter()) {
-                    currentWord.append(config.label)
+                if (text.length == 1 && text[0].isLetter()) {
+                    currentWord.append(text)
                 } else {
                     currentWord.clear()
+                }
+                if (shiftState == ShiftState.ONCE) {
+                    shiftState = ShiftState.OFF
+                    refreshLabels()
                 }
             }
             KeyAction.BACKSPACE -> {}
@@ -230,23 +400,21 @@ class MyKeyboardIME : InputMethodService() {
         }
     }
 
-    private fun updateCaps() {
-        for (keyView in letterKeys) {
-            keyView.displayLabel =
-                if (capsOn) keyView.displayLabel.uppercase() else keyView.displayLabel.lowercase()
-        }
-    }
-
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
-        capsOn = false
         currentWord.clear()
         pendingCorrection = null
-        predictedKeyView?.isPredicted = false
-        predictedKeyView = null
-        for (keyView in letterKeys) {
-            keyView.displayLabel = keyView.displayLabel.lowercase()
+        if (!restarting) {
+            shiftState = ShiftState.OFF
+            page = Page.LETTERS
         }
+        // Rebuild so settings and key edits apply every time the keyboard opens.
+        if (::keyboardRoot.isInitialized) populateKeyboard()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        super.onFinishInputView(finishingInput)
+        stopRepeating()
     }
 
     private fun vibrateKey() {
