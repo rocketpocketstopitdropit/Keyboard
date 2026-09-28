@@ -4,64 +4,124 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
 import android.os.Bundle
+import android.util.TypedValue
+import android.view.Gravity
 import android.view.View
-import android.widget.Button
+import android.view.ViewGroup
+import android.widget.CompoundButton
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.Switch
 import android.widget.TextView
 
+/**
+ * The top half is the real keyboard, drawn by the same code the keyboard itself
+ * uses. Tap a key to edit it. The controls underneath change the keyboard's
+ * size and look, and the preview updates as you drag.
+ */
 class KeyEditorActivity : Activity() {
+
+    private lateinit var previewHolder: FrameLayout
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val matchParent = ViewGroup.LayoutParams.MATCH_PARENT
+        val wrapContent = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val screen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(24), dp(12), dp(12))
+        }
+
+        screen.addView(TextView(this).apply {
+            text = "Tap any key to edit it. The controls below change this preview right away."
+            textSize = 13f
+            setPadding(0, 0, 0, dp(12))
+        })
+
+        previewHolder = FrameLayout(this)
+        screen.addView(previewHolder, LinearLayout.LayoutParams(matchParent, wrapContent))
+
+        val controls = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        controls.addView(
+            sliderRow("Key height", 24, 72, KeyboardPrefs.getKeyHeight(this), "dp") {
+                KeyboardPrefs.setKeyHeight(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(
+            sliderRow("Key width", 50, 100, KeyboardPrefs.getKeyWidth(this), "%") {
+                KeyboardPrefs.setKeyWidth(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(
+            sliderRow("Key spacing", 0, 8, KeyboardPrefs.getKeySpacing(this), "dp") {
+                KeyboardPrefs.setKeySpacing(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(
+            sliderRow("Haptic intensity", 0, 100, KeyboardPrefs.getHapticIntensity(this), "%") {
+                KeyboardPrefs.setHapticIntensity(this, it)
+            }
+        )
+        controls.addView(
+            toggleRow("Show number row", KeyboardPrefs.getShowNumberRow(this)) {
+                KeyboardPrefs.setShowNumberRow(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(
+            toggleRow("Show corner hints", KeyboardPrefs.getShowHints(this)) {
+                KeyboardPrefs.setShowHints(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(
+            toggleRow("Highlight predicted key", KeyboardPrefs.getShowPredictedHighlight(this)) {
+                KeyboardPrefs.setShowPredictedHighlight(this, it); rebuildPreview()
+            }
+        )
+
+        screen.addView(
+            ScrollView(this).apply { addView(controls) },
+            LinearLayout.LayoutParams(matchParent, 0, 1f)
+        )
+        setContentView(screen)
         rebuildPreview()
     }
 
     private fun rebuildPreview() {
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(32, 48, 32, 32)
+        previewHolder.removeAllViews()
+        val built = KeyboardBuilder.build(
+            context = this,
+            page = KeyboardPage.LETTERS,
+            onTap = { _ -> },
+            onFlick = { _, _ -> }
+        )
+        for (kv in built.keys) {
+            val address = kv.tag as? KeyAddress ?: continue
+            kv.setOnClickListener { openEditDialog(address.row, address.col) }
         }
-        root.addView(TextView(this).apply {
-            text = "Tap any key to change its label, flick corners, or color."
-            textSize = 14f
-            setPadding(0, 0, 0, 24)
-        })
-
-        KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
-            val rowLayout = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = 8; bottomMargin = 8 }
-            }
-            row.forEachIndexed { colIndex, defaultConfig ->
-                val effective = KeyLayoutStore.effectiveConfig(this, rowIndex, colIndex, defaultConfig)
-                val button = Button(this).apply {
-                    text = effective.label
-                    textSize = 14f
-                    layoutParams = LinearLayout.LayoutParams(
-                        0, LinearLayout.LayoutParams.WRAP_CONTENT, effective.weight
-                    ).apply { marginStart = 4; marginEnd = 4 }
-                    if (effective.colorHex != null) setBackgroundColor(Color.parseColor(effective.colorHex))
-                    setOnClickListener { openEditDialog(rowIndex, colIndex) }
-                }
-                rowLayout.addView(button)
-            }
-            root.addView(rowLayout)
-        }
-
-        setContentView(ScrollView(this).apply { addView(root) })
+        previewHolder.addView(
+            built.root,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
     }
 
     private fun openEditDialog(row: Int, col: Int) {
-        val default = KeyboardLayout.ROWS[row][col]
+        val default = KeyboardLayout.defaultFor(row, col)
         val current = KeyLayoutStore.effectiveConfig(this, row, col, default)
 
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(40, 16, 40, 8)
+            setPadding(dp(20), dp(8), dp(20), dp(4))
         }
 
         fun field(hint: String, initial: String?): EditText {
@@ -81,13 +141,13 @@ class KeyEditorActivity : Activity() {
         var selectedColor: String? = current.colorHex
         container.addView(TextView(this).apply {
             text = "Key color (tap one; gray = use theme default):"
-            setPadding(0, 24, 0, 8)
+            setPadding(0, dp(12), 0, dp(8))
         })
         val swatchRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val palette = listOf(null, "#E74C3C", "#E67E22", "#F1C40F", "#2ECC71", "#3498DB", "#9B59B6")
         palette.forEach { hex ->
             val swatch = View(this).apply {
-                layoutParams = LinearLayout.LayoutParams(72, 72).apply { marginEnd = 12 }
+                layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply { marginEnd = dp(6) }
                 setBackgroundColor(if (hex != null) Color.parseColor(hex) else Color.DKGRAY)
                 setOnClickListener { selectedColor = hex }
             }
@@ -118,4 +178,63 @@ class KeyEditorActivity : Activity() {
             .setNegativeButton("Cancel", null)
             .show()
     }
+
+    private fun sliderRow(
+        label: String, min: Int, max: Int, initial: Int, unit: String,
+        onChange: (Int) -> Unit
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, dp(10), 0, dp(10))
+        }
+        val valueText = TextView(this)
+        val labelRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        labelRow.addView(TextView(this).apply {
+            text = label
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        valueText.text = "$initial$unit"
+        labelRow.addView(valueText)
+        row.addView(labelRow)
+
+        val seekBar = SeekBar(this).apply {
+            this.max = max - min
+            progress = (initial - min).coerceIn(0, max - min)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                    val value = progress + min
+                    valueText.text = "$value$unit"
+                    if (fromUser) onChange(value)
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        row.addView(seekBar)
+        return row
+    }
+
+    private fun toggleRow(label: String, initial: Boolean, onChange: (Boolean) -> Unit): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        row.addView(TextView(this).apply {
+            text = label
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        row.addView(Switch(this).apply {
+            isChecked = initial
+            setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener { _, checked ->
+                onChange(checked)
+            })
+        })
+        return row
+    }
+
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
+        ).toInt()
 }
