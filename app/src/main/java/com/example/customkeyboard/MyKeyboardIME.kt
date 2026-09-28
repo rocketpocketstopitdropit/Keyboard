@@ -13,19 +13,19 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
-import android.widget.LinearLayout
+import android.widget.FrameLayout
 import kotlin.math.abs
 
 class MyKeyboardIME : InputMethodService() {
 
-    private enum class Page { LETTERS, SYMBOLS_1, SYMBOLS_2 }
     private enum class ShiftState { OFF, ONCE, LOCKED }
 
-    private var page = Page.LETTERS
+    private var page = KeyboardPage.LETTERS
     private var shiftState = ShiftState.OFF
     private var lastShiftTapTime = 0L
 
-    private lateinit var keyboardRoot: LinearLayout
+    private lateinit var keyboardContainer: FrameLayout
+    private var builtRoot: View? = null
     private val letterKeys = mutableListOf<KeyView>()
     private val allKeys = mutableListOf<KeyView>()
 
@@ -46,76 +46,37 @@ class MyKeyboardIME : InputMethodService() {
     private var lastScrubX = 0f
 
     override fun onCreateInputView(): View {
-        keyboardRoot = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(getColor(R.color.keyboard_background))
-            setPadding(dp(4), dp(6), dp(4), dp(6))
-        }
-        keyboardRoot.setOnTouchListener { _, event -> handleTouch(event) }
+        keyboardContainer = FrameLayout(this)
         populateKeyboard()
-        return keyboardRoot
+        return keyboardContainer
     }
 
-    /** Rebuilds every key for the current page. Also re-reads settings and key edits. */
+    /** Rebuilds the keyboard for the current page. Also re-reads settings and key edits. */
     private fun populateKeyboard() {
         stopRepeating()
-        keyboardRoot.removeAllViews()
-        letterKeys.clear()
-        allKeys.clear()
+        keyboardContainer.removeAllViews()
         predictedKeyView = null
         activeKeyView = null
 
-        val keyHeight = KeyboardPrefs.getKeyHeight(this)
-        val keySpacing = KeyboardPrefs.getKeySpacing(this)
-        val showHints = KeyboardPrefs.getShowHints(this)
-        val showHighlight = KeyboardPrefs.getShowPredictedHighlight(this)
-        val showNumberRow = KeyboardPrefs.getShowNumberRow(this)
-
-        fun buildRow(rowConfigs: List<KeyConfig>) {
-            val rowLayout = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(3); bottomMargin = dp(3) }
-            }
-            for (keyConfig in rowConfigs) {
-                val keyView = KeyView(
-                    context = this,
-                    config = keyConfig,
-                    onTap = { cfg -> handleTap(cfg) },
-                    onFlick = { _, alt -> commitDirect(alt) },
-                    showHints = showHints,
-                    showPredictedHighlight = showHighlight
-                ).apply {
-                    layoutParams = LinearLayout.LayoutParams(
-                        0, dp(keyHeight), keyConfig.weight
-                    ).apply { marginStart = dp(keySpacing); marginEnd = dp(keySpacing) }
-                }
-                rowLayout.addView(keyView)
-                allKeys.add(keyView)
-
-                if (keyConfig.action == KeyAction.CHAR && keyConfig.label.length == 1 &&
-                    keyConfig.label[0].isLetter()
-                ) {
-                    letterKeys.add(keyView)
-                }
-            }
-            keyboardRoot.addView(rowLayout)
-        }
-
-        when (page) {
-            Page.LETTERS -> {
-                if (showNumberRow) buildRow(KeyboardLayout.NUMBER_ROW)
-                KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
-                    buildRow(row.mapIndexed { colIndex, defaultConfig ->
-                        KeyLayoutStore.effectiveConfig(this, rowIndex, colIndex, defaultConfig)
-                    })
-                }
-            }
-            Page.SYMBOLS_1 -> KeyboardLayout.SYMBOLS_1.forEach { buildRow(it) }
-            Page.SYMBOLS_2 -> KeyboardLayout.SYMBOLS_2.forEach { buildRow(it) }
-        }
+        val built = KeyboardBuilder.build(
+            context = this,
+            page = page,
+            onTap = { cfg -> handleTap(cfg) },
+            onFlick = { _, alt -> commitDirect(alt) }
+        )
+        built.root.setOnTouchListener { _, event -> handleTouch(event) }
+        keyboardContainer.addView(
+            built.root,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        builtRoot = built.root
+        allKeys.clear()
+        allKeys.addAll(built.keys)
+        letterKeys.clear()
+        letterKeys.addAll(built.letterKeys)
         refreshLabels()
     }
 
@@ -266,10 +227,11 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
+        val root = builtRoot ?: return null
         predictedKeyView?.let { predicted ->
-            if (predicted.absoluteHitRect().contains(x, y)) return predicted
+            if (predicted.hitRectIn(root).contains(x, y)) return predicted
         }
-        return allKeys.firstOrNull { it.absoluteHitRect().contains(x, y) }
+        return allKeys.firstOrNull { it.hitRectIn(root).contains(x, y) }
     }
 
     // ---------- Key actions ----------
@@ -328,20 +290,20 @@ class MyKeyboardIME : InputMethodService() {
                 return
             }
             KeyAction.SYMBOLS -> {
-                page = Page.SYMBOLS_1
+                page = KeyboardPage.SYMBOLS_1
                 shiftState = ShiftState.OFF
                 currentWord.clear()
                 populateKeyboard()
                 return
             }
             KeyAction.SYMBOLS_ALT -> {
-                page = if (page == Page.SYMBOLS_1) Page.SYMBOLS_2 else Page.SYMBOLS_1
+                page = if (page == KeyboardPage.SYMBOLS_1) KeyboardPage.SYMBOLS_2 else KeyboardPage.SYMBOLS_1
                 currentWord.clear()
                 populateKeyboard()
                 return
             }
             KeyAction.LETTERS -> {
-                page = Page.LETTERS
+                page = KeyboardPage.LETTERS
                 currentWord.clear()
                 populateKeyboard()
                 return
@@ -406,10 +368,10 @@ class MyKeyboardIME : InputMethodService() {
         pendingCorrection = null
         if (!restarting) {
             shiftState = ShiftState.OFF
-            page = Page.LETTERS
+            page = KeyboardPage.LETTERS
         }
         // Rebuild so settings and key edits apply every time the keyboard opens.
-        if (::keyboardRoot.isInitialized) populateKeyboard()
+        if (::keyboardContainer.isInitialized) populateKeyboard()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
