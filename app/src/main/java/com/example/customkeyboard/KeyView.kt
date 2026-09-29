@@ -11,6 +11,18 @@ import android.widget.FrameLayout
 import android.widget.TextView
 import kotlin.math.sqrt
 
+/**
+ * One key, rendered as a bubble: convex (puffed-out) at rest, concave
+ * (dimpled-in) while pressed — done with a radial gradient rather than
+ * actual movement, so the key never resizes or shifts, only its shading
+ * changes. The character label sits flat on top the whole time.
+ *
+ * Touch handling/hit-testing happens at the keyboard-container level (see
+ * MyKeyboardIME) so a predicted key's expanded hitbox can reach into its
+ * neighbors' visual space — this view just reports its own rect and
+ * resolves tap-vs-flick once told "you were the target, here's where the
+ * finger went."
+ */
 class KeyView(
     context: Context,
     val config: KeyConfig,
@@ -24,6 +36,8 @@ class KeyView(
         const val FLICK_THRESHOLD_DP = 18
         const val PREDICTED_EXPAND_DP = 20
         const val CORNER_RADIUS_DP = 12
+        // Fixed gradient radius rather than measuring each key precisely —
+        // generous enough to shade every key size we use, simple and cheap.
         const val GRADIENT_RADIUS_DP = 90
     }
 
@@ -36,6 +50,7 @@ class KeyView(
 
     private var isPressedIn = false
 
+    /** Set true on at most one key at a time by the IME. */
     var isPredicted: Boolean = false
         set(value) {
             field = value
@@ -59,6 +74,8 @@ class KeyView(
         val light: Int
         val dark: Int
         if (config.colorHex != null) {
+            // Custom per-key color from the Key Editor — derive light/dark
+            // shading from it by blending toward white/black.
             mid = Color.parseColor(config.colorHex)
             light = blend(mid, Color.WHITE, 0.35f)
             dark = blend(mid, Color.BLACK, 0.45f)
@@ -72,6 +89,8 @@ class KeyView(
         val cornerPx = dp(CORNER_RADIUS_DP)
         val gradientPx = dp(GRADIENT_RADIUS_DP)
 
+        // Convex / resting: bright spot top-left fading toward a dark edge —
+        // reads as a bubble puffing UP out of the flat keyboard.
         restDrawable = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = cornerPx
@@ -81,6 +100,8 @@ class KeyView(
             setGradientCenter(0.32f, 0.28f)
         }
 
+        // Concave / pressed: dark spot bottom-right with a lighter rim —
+        // reads as the bubble dimpling INTO the board.
         pressedDrawable = GradientDrawable().apply {
             shape = GradientDrawable.RECTANGLE
             cornerRadius = cornerPx
@@ -109,6 +130,7 @@ class KeyView(
         }
     }
 
+    /** Blends `color` toward `target` by `ratio` (0 = no change, 1 = fully `target`). */
     private fun blend(color: Int, target: Int, ratio: Float): Int {
         val r = (Color.red(color) * (1 - ratio) + Color.red(target) * ratio).toInt()
         val g = (Color.green(color) * (1 - ratio) + Color.green(target) * ratio).toInt()
@@ -136,6 +158,8 @@ class KeyView(
     }
 
     private fun updateBackground() {
+        // The predicted key's expanded hitbox always works regardless of this
+        // setting — this only controls whether it's visibly colored differently.
         if (isPredicted && showPredictedHighlight) {
             setBackgroundColor(context.getColor(R.color.key_pressed))
             return
@@ -143,8 +167,12 @@ class KeyView(
         background = if (isPressedIn) pressedDrawable else restDrawable
     }
 
+    /** Never widened — this key's true on-screen bounds. */
+    fun rawLocalRect(): Rect = Rect(left, top, right, bottom)
+
+    /** Widened into neighbors when this key is the predicted one. */
     fun localHitRect(): Rect {
-        val r = Rect(left, top, right, bottom)
+        val r = rawLocalRect()
         if (isPredicted) r.inset(-expandPx, -expandPx)
         return r
     }
