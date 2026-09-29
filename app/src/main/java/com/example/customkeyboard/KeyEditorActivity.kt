@@ -8,6 +8,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.widget.Button
 import android.widget.CompoundButton
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -16,6 +17,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 
 class KeyEditorActivity : Activity() {
 
@@ -85,6 +87,16 @@ class KeyEditorActivity : Activity() {
             ScrollView(this).apply { addView(controls) },
             LinearLayout.LayoutParams(matchParent, 0, 1f)
         )
+
+        // Every change above already saves itself instantly — this button is
+        // just a reassuring confirmation, not a requirement.
+        screen.addView(Button(this).apply {
+            text = "Save"
+            setOnClickListener {
+                Toast.makeText(this@KeyEditorActivity, "Settings saved", Toast.LENGTH_SHORT).show()
+            }
+        })
+
         setContentView(screen)
         rebuildPreview()
     }
