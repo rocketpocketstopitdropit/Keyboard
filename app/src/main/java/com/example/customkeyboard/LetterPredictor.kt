@@ -24,11 +24,12 @@ object LetterPredictor {
         'v' to 'e'
     )
 
-    fun predictNext(wordSoFar: String): Char? {
-        if (wordSoFar.isEmpty()) return null
+    fun predictNext(previousWord: String, wordSoFar: String): Char? {
         val lower = wordSoFar.lowercase()
 
-        WordPredictor.predictNextChar(lower)?.let { return it }
+        WordPredictor.predictNextChar(previousWord, lower)?.let { return it }
+
+        if (lower.isEmpty()) return null
 
         if (lower.length >= 2) {
             trigramMap[lower.takeLast(2)]?.let { return it }
