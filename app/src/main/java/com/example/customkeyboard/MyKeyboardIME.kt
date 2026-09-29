@@ -48,6 +48,8 @@ class MyKeyboardIME : InputMethodService() {
 
     private val currentWord = StringBuilder()
     private var pendingCorrection: Pair<String, String>? = null
+    // The exact word that was just un-autocorrected via an immediate backspace.
+    // The very next space for this same word won't be auto-corrected again.
     private var autocorrectSuppressedWord: String? = null
 
     private val uiHandler = Handler(Looper.getMainLooper())
@@ -87,6 +89,7 @@ class MyKeyboardIME : InputMethodService() {
         return keyboardContainer
     }
 
+    /** Rebuilds the keyboard for the current page. Also re-reads settings and key edits. */
     private fun populateKeyboard() {
         stopRepeating()
         keyboardContainer.removeAllViews()
@@ -124,7 +127,7 @@ class MyKeyboardIME : InputMethodService() {
         when (action) {
             AccessoryAction.SETTINGS -> {
                 startActivity(
-                    Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    Intent(this, KeyEditorActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 )
             }
             AccessoryAction.GIF -> {
@@ -175,6 +178,7 @@ class MyKeyboardIME : InputMethodService() {
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
                 val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                    ?.replaceFirstChar { it.uppercase() }
                 if (!text.isNullOrBlank()) currentInputConnection?.commitText("$text ", 1)
                 stopListening()
             }
@@ -204,7 +208,7 @@ class MyKeyboardIME : InputMethodService() {
     private fun outputFor(config: KeyConfig): String {
         if (shiftState == ShiftState.OFF) return config.label
         config.shiftLabel?.let { return it }
-        return if (config.label.length == 1 && config.label[0].isLetter())
+                return if (config.label.length == 1 && config.label[0].isLetter())
             config.label.uppercase()
         else config.label
     }
@@ -339,10 +343,15 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
         val root = builtRoot ?: return null
+        // A clean tap inside any key's real bounds always wins. The predicted
+        // key's widened zone only gets a say if the tap missed every key
+        // outright (landed in the gap between keys) — it never overrides a
+        // tap that actually landed on a different, real key.
+        allKeys.firstOrNull { it.rawHitRectIn(root).contains(x, y) }?.let { return it }
         predictedKeyView?.let { predicted ->
             if (predicted.hitRectIn(root).contains(x, y)) return predicted
         }
-        return allKeys.firstOrNull { it.hitRectIn(root).contains(x, y) }
+        return null
     }
 
     // ---------- Key actions ----------
@@ -365,6 +374,7 @@ class MyKeyboardIME : InputMethodService() {
                 ic.commitText(original, 1)
                 currentWord.clear()
                 currentWord.append(original)
+                // Don't auto-correct this same word again on the very next space.
                 autocorrectSuppressedWord = original
             } else {
                 val selected = ic.getSelectedText(0)
@@ -485,6 +495,12 @@ class MyKeyboardIME : InputMethodService() {
         currentWord.clear()
         pendingCorrection = null
         autocorrectSuppressedWord = null
+        // "restarting" means the same keyboard view is just moving to another
+        // field (e.g. tabbing between fields in a form). Rebuilding the whole
+        // keyboard — every key, every gradient — on each of those was the
+        // main cause of the sluggish/delayed-input feeling. Only rebuild on a
+        // genuinely fresh session, which is also when Settings/Key Editor
+        // changes are meant to take effect.
         if (!restarting) {
             shiftState = ShiftState.OFF
             page = KeyboardPage.LETTERS
