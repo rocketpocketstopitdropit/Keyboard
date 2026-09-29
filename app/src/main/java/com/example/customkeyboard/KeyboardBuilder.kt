@@ -24,16 +24,21 @@ class BuiltKeyboard(
     val micButton: TextView?
 )
 
-/** This key's touch area (widened when it's the predicted key), in `root`'s coordinates. */
-fun KeyView.hitRectIn(root: View): Rect {
-    val r = localHitRect()
-    var p = parent as? View
+private fun offsetToRoot(rect: Rect, view: View, root: View): Rect {
+    val r = Rect(rect)
+    var p = view.parent as? View
     while (p != null && p !== root) {
         r.offset(p.left, p.top)
         p = p.parent as? View
     }
     return r
 }
+
+/** This key's touch area (widened when it's the predicted key), in `root`'s coordinates. */
+fun KeyView.hitRectIn(root: View): Rect = offsetToRoot(localHitRect(), this, root)
+
+/** This key's TRUE touch area, never widened, in `root`'s coordinates. */
+fun KeyView.rawHitRectIn(root: View): Rect = offsetToRoot(rawLocalRect(), this, root)
 
 /**
  * Builds the whole keyboard: a top strip (accessory icons on the left, the
@@ -225,4 +230,3 @@ object KeyboardBuilder {
         return BuiltKeyboard(root, keys, letterKeys, micButton)
     }
 }
-
