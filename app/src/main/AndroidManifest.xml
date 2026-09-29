@@ -20,11 +20,6 @@
         </activity>
 
         <activity
-            android:name=".SettingsActivity"
-            android:exported="false"
-            android:label="Keyboard Settings" />
-
-        <activity
             android:name=".KeyEditorActivity"
             android:exported="false"
             android:label="Edit Keys" />
