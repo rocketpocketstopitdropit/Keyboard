@@ -47,9 +47,8 @@ class MyKeyboardIME : InputMethodService() {
     private var downY = 0f
 
     private val currentWord = StringBuilder()
+    private var previousWord: String = ""
     private var pendingCorrection: Pair<String, String>? = null
-    // The exact word that was just un-autocorrected via an immediate backspace.
-    // The very next space for this same word won't be auto-corrected again.
     private var autocorrectSuppressedWord: String? = null
 
     private val uiHandler = Handler(Looper.getMainLooper())
@@ -89,7 +88,6 @@ class MyKeyboardIME : InputMethodService() {
         return keyboardContainer
     }
 
-    /** Rebuilds the keyboard for the current page. Also re-reads settings and key edits. */
     private fun populateKeyboard() {
         stopRepeating()
         keyboardContainer.removeAllViews()
@@ -208,11 +206,10 @@ class MyKeyboardIME : InputMethodService() {
     private fun outputFor(config: KeyConfig): String {
         if (shiftState == ShiftState.OFF) return config.label
         config.shiftLabel?.let { return it }
-                return if (config.label.length == 1 && config.label[0].isLetter())
+        return if (config.label.length == 1 && config.label[0].isLetter())
             config.label.uppercase()
         else config.label
     }
-
     private fun refreshLabels() {
         for (kv in allKeys) {
             val cfg = kv.config
@@ -320,6 +317,7 @@ class MyKeyboardIME : InputMethodService() {
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
         currentWord.clear()
+        previousWord = ""
         pendingCorrection = null
         updatePrediction()
     }
@@ -343,10 +341,6 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
         val root = builtRoot ?: return null
-        // A clean tap inside any key's real bounds always wins. The predicted
-        // key's widened zone only gets a say if the tap missed every key
-        // outright (landed in the gap between keys) — it never overrides a
-        // tap that actually landed on a different, real key.
         allKeys.firstOrNull { it.rawHitRectIn(root).contains(x, y) }?.let { return it }
         predictedKeyView?.let { predicted ->
             if (predicted.hitRectIn(root).contains(x, y)) return predicted
@@ -374,7 +368,6 @@ class MyKeyboardIME : InputMethodService() {
                 ic.commitText(original, 1)
                 currentWord.clear()
                 currentWord.append(original)
-                // Don't auto-correct this same word again on the very next space.
                 autocorrectSuppressedWord = original
             } else {
                 val selected = ic.getSelectedText(0)
@@ -446,6 +439,7 @@ class MyKeyboardIME : InputMethodService() {
                 } else {
                     ic.commitText(" ", 1)
                 }
+                if (typed.isNotEmpty()) previousWord = (correction ?: typed).lowercase()
                 currentWord.clear()
             }
             KeyAction.CHAR -> {
@@ -454,6 +448,7 @@ class MyKeyboardIME : InputMethodService() {
                 if (text.length == 1 && text[0].isLetter()) {
                     currentWord.append(text)
                 } else {
+                    if (currentWord.isNotEmpty()) previousWord = currentWord.toString().lowercase()
                     currentWord.clear()
                 }
                 if (shiftState == ShiftState.ONCE) {
@@ -468,6 +463,7 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun commitDirect(text: String) {
         currentInputConnection?.commitText(text, 1)
+        if (currentWord.isNotEmpty()) previousWord = currentWord.toString().lowercase()
         currentWord.clear()
         pendingCorrection = null
         autocorrectSuppressedWord = null
@@ -478,7 +474,7 @@ class MyKeyboardIME : InputMethodService() {
         predictedKeyView?.isPredicted = false
         predictedKeyView = null
 
-        val guess = LetterPredictor.predictNext(currentWord.toString()) ?: return
+        val guess = LetterPredictor.predictNext(previousWord, currentWord.toString()) ?: return
         if (guess == ' ') return
 
         val target = letterKeys.firstOrNull { key ->
@@ -495,12 +491,7 @@ class MyKeyboardIME : InputMethodService() {
         currentWord.clear()
         pendingCorrection = null
         autocorrectSuppressedWord = null
-        // "restarting" means the same keyboard view is just moving to another
-        // field (e.g. tabbing between fields in a form). Rebuilding the whole
-        // keyboard — every key, every gradient — on each of those was the
-        // main cause of the sluggish/delayed-input feeling. Only rebuild on a
-        // genuinely fresh session, which is also when Settings/Key Editor
-        // changes are meant to take effect.
+        previousWord = ""
         if (!restarting) {
             shiftState = ShiftState.OFF
             page = KeyboardPage.LETTERS
