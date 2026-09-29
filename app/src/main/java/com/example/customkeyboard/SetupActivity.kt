@@ -42,15 +42,8 @@ class SetupActivity : Activity() {
             }
         }
 
-        val settingsButton = Button(this).apply {
-            text = "3. Keyboard settings"
-            setOnClickListener {
-                startActivity(Intent(this@SetupActivity, SettingsActivity::class.java))
-            }
-        }
-
         val editorButton = Button(this).apply {
-            text = "4. Edit keys"
+            text = "3. Edit keys & settings"
             setOnClickListener {
                 startActivity(Intent(this@SetupActivity, KeyEditorActivity::class.java))
             }
@@ -59,7 +52,6 @@ class SetupActivity : Activity() {
         layout.addView(instructionsText)
         layout.addView(enableButton)
         layout.addView(switchButton)
-        layout.addView(settingsButton)
         layout.addView(editorButton)
         setContentView(layout)
     }
