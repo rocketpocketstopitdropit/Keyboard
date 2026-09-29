@@ -41,22 +41,27 @@ object Autocorrector {
         return dp[a.length][b.length]
     }
 
+    private const val FREQUENCY_WEIGHT = 0.35
+
     fun correctionFor(typedWord: String): String? {
         val lower = typedWord.lowercase()
         if (lower.length < 2) return null
-        if (WordPredictor.COMMON_WORDS.contains(lower)) return null
+        if (WordPredictor.WORDS.contains(lower)) return null
 
         var best: String? = null
-        var bestDist = Double.MAX_VALUE
-        for (candidate in WordPredictor.COMMON_WORDS) {
+        var bestScore = Double.MAX_VALUE
+        var bestRawDist = Double.MAX_VALUE
+        for (candidate in WordPredictor.WORDS) {
             if (abs(candidate.length - lower.length) > 2) continue
             val dist = typoDistance(lower, candidate)
-            if (dist < bestDist) {
-                bestDist = dist
+            val score = dist - FREQUENCY_WEIGHT * WordPredictor.frequencyOf(candidate)
+            if (score < bestScore) {
+                bestScore = score
+                bestRawDist = dist
                 best = candidate
             }
         }
         val threshold = 1.2
-        return if (best != null && bestDist <= threshold && best != lower) best else null
+        return if (best != null && bestRawDist <= threshold && best != lower) best else null
     }
 }
