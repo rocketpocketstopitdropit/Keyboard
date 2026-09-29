@@ -17,11 +17,6 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 
-/**
- * The top half is the real keyboard, drawn by the same code the keyboard itself
- * uses. Tap a key to edit it. The controls underneath change the keyboard's
- * size and look, and the preview updates as you drag.
- */
 class KeyEditorActivity : Activity() {
 
     private lateinit var previewHolder: FrameLayout
@@ -100,7 +95,8 @@ class KeyEditorActivity : Activity() {
             context = this,
             page = KeyboardPage.LETTERS,
             onTap = { _ -> },
-            onFlick = { _, _ -> }
+            onFlick = { _, _ -> },
+            onAccessory = { _ -> }
         )
         for (kv in built.keys) {
             val address = kv.tag as? KeyAddress ?: continue
@@ -155,6 +151,15 @@ class KeyEditorActivity : Activity() {
         }
         container.addView(swatchRow)
 
+        var customHeightEnabled = current.heightDp != null
+        var customHeightValue = current.heightDp ?: KeyboardPrefs.getKeyHeight(this)
+        container.addView(
+            toggleRow("Custom height for this key", customHeightEnabled) { customHeightEnabled = it }
+        )
+        container.addView(
+            sliderRow("Key height override", 24, 90, customHeightValue, "dp") { customHeightValue = it }
+        )
+
         AlertDialog.Builder(this)
             .setTitle("Edit key")
             .setView(ScrollView(this).apply { addView(container) })
@@ -166,7 +171,8 @@ class KeyEditorActivity : Activity() {
                     topRight = trField.text.toString().ifBlank { null },
                     bottomLeft = blField.text.toString().ifBlank { null },
                     bottomRight = brField.text.toString().ifBlank { null },
-                    colorHex = selectedColor
+                    colorHex = selectedColor,
+                    heightDp = if (customHeightEnabled) customHeightValue else null
                 )
                 KeyLayoutStore.setOverride(this, row, col, override)
                 rebuildPreview()
