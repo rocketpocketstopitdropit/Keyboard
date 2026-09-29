@@ -9,12 +9,18 @@ data class KeyConfig(
     val weight: Float = 1f,
     val action: KeyAction = KeyAction.CHAR,
     val colorHex: String? = null,
-    // What this key shows and types while Shift is on.
-    // null = uppercase of the label for letters, unchanged for anything else.
-    val shiftLabel: String? = null
+    val shiftLabel: String? = null,
+    // Per-key height override, in dp. null = use the global "Key height" setting.
+    val heightDp: Int? = null,
+    // What actually gets typed, if different from the visible label
+    // (used for clipboard entries: short preview label, full pasted text here).
+    val commitOverride: String? = null
 )
 
-enum class KeyAction { CHAR, SHIFT, BACKSPACE, ENTER, SPACE, SYMBOLS, SYMBOLS_ALT, LETTERS }
+enum class KeyAction {
+    CHAR, SHIFT, BACKSPACE, ENTER, SPACE, SYMBOLS, SYMBOLS_ALT, LETTERS,
+    SPACER // invisible, non-tappable filler — not a real key
+}
 
 object KeyboardLayout {
 
@@ -24,13 +30,11 @@ object KeyboardLayout {
     private fun plainW(weight: Float, vararg labels: String): List<KeyConfig> =
         labels.map { KeyConfig(it, weight = weight) }
 
-    // The backspace key that sits in the notch above the top-right of the keyboard.
     val NOTCH_KEY = KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
 
     /** The built-in key at this position. row = -1 is the notch key. */
     fun defaultFor(row: Int, col: Int): KeyConfig = if (row < 0) NOTCH_KEY else ROWS[row][col]
 
-    // Optional row above the letters. Shows these symbols while Shift is on.
     val NUMBER_ROW: List<KeyConfig> = listOf(
         KeyConfig("1", shiftLabel = "!"), KeyConfig("2", shiftLabel = "@"),
         KeyConfig("3", shiftLabel = "#"), KeyConfig("4", shiftLabel = "\$"),
@@ -39,7 +43,6 @@ object KeyboardLayout {
         KeyConfig("9", shiftLabel = "("), KeyConfig("0", shiftLabel = ")")
     )
 
-    // Numbers and symbols page, reached with the 123 key.
     val SYMBOLS_1: List<List<KeyConfig>> = listOf(
         plain("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"),
         plain("-", "/", ":", ";", "(", ")", "\$", "&", "@", "\""),
@@ -52,7 +55,6 @@ object KeyboardLayout {
         )
     )
 
-    // Second symbols page, reached with the =\< key.
     val SYMBOLS_2: List<List<KeyConfig>> = listOf(
         plain("[", "]", "{", "}", "#", "%", "^", "*", "+", "="),
         plain("_", "\\", "|", "~", "<", ">", "€", "£", "¥", "•"),
@@ -63,6 +65,15 @@ object KeyboardLayout {
             KeyConfig(" ", weight = 5f, action = KeyAction.SPACE),
             KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
         )
+    )
+
+    // Simple emoji picker page.
+    val EMOJI_ROWS: List<List<KeyConfig>> = listOf(
+        plain("😀", "😂", "😍", "🙂", "😉", "😢", "😡", "😴"),
+        plain("👍", "👎", "👏", "🙏", "💪", "🤝", "✌️", "🤞"),
+        plain("❤️", "🔥", "🎉", "✅", "⭐", "💯", "🙌", "👀"),
+        plain("🐶", "🐱", "☕", "🍕", "⚽", "🚗", "🌙", "☀️"),
+        listOf(KeyConfig("ABC", weight = 2f, action = KeyAction.LETTERS))
     )
 
     val ROWS: List<List<KeyConfig>> = listOf(
@@ -85,7 +96,11 @@ object KeyboardLayout {
             KeyConfig("z", weight = 1.2f), KeyConfig("x", weight = 1.2f),
             KeyConfig("c", weight = 1.2f), KeyConfig("v", weight = 1.2f),
             KeyConfig("b", weight = 1.2f), KeyConfig("n", weight = 1.2f),
-            KeyConfig("m", weight = 1.2f)
+            KeyConfig("m", weight = 1.2f),
+            // Invisible filler so "m" lands where a traditional keyboard has it,
+            // instead of stretching all the way to the edge now that backspace
+            // moved up into the notch.
+            KeyConfig("", weight = 1.5f, action = KeyAction.SPACER)
         ),
         listOf(
             KeyConfig("123", weight = 1.5f, action = KeyAction.SYMBOLS),
@@ -96,3 +111,4 @@ object KeyboardLayout {
         )
     )
 }
+
