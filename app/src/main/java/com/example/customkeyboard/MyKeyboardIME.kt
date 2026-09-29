@@ -1,12 +1,20 @@
 package com.example.customkeyboard
 
+import android.Manifest
+import android.content.ClipboardManager
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.TypedValue
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -14,6 +22,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.widget.FrameLayout
+import android.widget.TextView
+import android.widget.Toast
+import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
 class MyKeyboardIME : InputMethodService() {
@@ -26,6 +37,7 @@ class MyKeyboardIME : InputMethodService() {
 
     private lateinit var keyboardContainer: FrameLayout
     private var builtRoot: View? = null
+    private var micButton: TextView? = null
     private val letterKeys = mutableListOf<KeyView>()
     private val allKeys = mutableListOf<KeyView>()
 
@@ -36,8 +48,8 @@ class MyKeyboardIME : InputMethodService() {
 
     private val currentWord = StringBuilder()
     private var pendingCorrection: Pair<String, String>? = null
+    private var autocorrectSuppressedWord: String? = null
 
-    // Hold-to-repeat (backspace) and space-bar slide state.
     private val uiHandler = Handler(Looper.getMainLooper())
     private var repeatRunnable: Runnable? = null
     private var backspaceHeld = false
@@ -45,13 +57,36 @@ class MyKeyboardIME : InputMethodService() {
     private var spaceSlideDir = 0
     private var lastScrubX = 0f
 
+    private val vibrator: Vibrator? by lazy { getSystemService(VIBRATOR_SERVICE) as? Vibrator }
+    private val clipboardManager: ClipboardManager by lazy {
+        getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+    }
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        val clip = clipboardManager.primaryClip
+        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() else null
+        if (!text.isNullOrBlank()) ClipboardHistoryStore.add(this, text)
+    }
+
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var listening = false
+
+    override fun onCreate() {
+        super.onCreate()
+        clipboardManager.addPrimaryClipChangedListener(clipListener)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        clipboardManager.removePrimaryClipChangedListener(clipListener)
+        speechRecognizer?.destroy()
+    }
+
     override fun onCreateInputView(): View {
         keyboardContainer = FrameLayout(this)
         populateKeyboard()
         return keyboardContainer
     }
 
-    /** Rebuilds the keyboard for the current page. Also re-reads settings and key edits. */
     private fun populateKeyboard() {
         stopRepeating()
         keyboardContainer.removeAllViews()
@@ -61,8 +96,10 @@ class MyKeyboardIME : InputMethodService() {
         val built = KeyboardBuilder.build(
             context = this,
             page = page,
+            clipboardHistory = ClipboardHistoryStore.getAll(this),
             onTap = { cfg -> handleTap(cfg) },
-            onFlick = { _, alt -> commitDirect(alt) }
+            onFlick = { _, alt -> commitDirect(alt) },
+            onAccessory = { action -> handleAccessory(action) }
         )
         built.root.setOnTouchListener { _, event -> handleTouch(event) }
         keyboardContainer.addView(
@@ -73,6 +110,7 @@ class MyKeyboardIME : InputMethodService() {
             )
         )
         builtRoot = built.root
+        micButton = built.micButton
         allKeys.clear()
         allKeys.addAll(built.keys)
         letterKeys.clear()
@@ -80,9 +118,89 @@ class MyKeyboardIME : InputMethodService() {
         refreshLabels()
     }
 
+    // ---------- Accessory row ----------
+
+    private fun handleAccessory(action: AccessoryAction) {
+        when (action) {
+            AccessoryAction.SETTINGS -> {
+                startActivity(
+                    Intent(this, SettingsActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            }
+            AccessoryAction.GIF -> {
+                Toast.makeText(this, "GIF search isn't set up yet — needs a provider connected.", Toast.LENGTH_SHORT).show()
+            }
+            AccessoryAction.EMOJI -> {
+                page = if (page == KeyboardPage.EMOJI) KeyboardPage.LETTERS else KeyboardPage.EMOJI
+                currentWord.clear()
+                populateKeyboard()
+            }
+            AccessoryAction.CLIPBOARD -> {
+                page = if (page == KeyboardPage.CLIPBOARD) KeyboardPage.LETTERS else KeyboardPage.CLIPBOARD
+                currentWord.clear()
+                populateKeyboard()
+            }
+            AccessoryAction.MIC -> onMicTapped()
+        }
+    }
+
+    private fun onMicTapped() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            startActivity(Intent(this, PermissionActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            Toast.makeText(this, "Allow microphone access, then tap the mic again.", Toast.LENGTH_LONG).show()
+            return
+        }
+        if (listening) {
+            stopListening()
+        } else {
+            startListening()
+        }
+    }
+
+    private fun startListening() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            Toast.makeText(this, "Speech recognition isn't available on this device.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        speechRecognizer = recognizer
+        listening = true
+        micButton?.text = "⏺"
+
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        }
+        recognizer.setRecognitionListener(object : RecognitionListener {
+            override fun onResults(results: Bundle?) {
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!text.isNullOrBlank()) currentInputConnection?.commitText("$text ", 1)
+                stopListening()
+            }
+            override fun onError(error: Int) {
+                stopListening()
+            }
+            override fun onReadyForSpeech(params: Bundle?) {}
+            override fun onBeginningOfSpeech() {}
+            override fun onRmsChanged(rmsdB: Float) {}
+            override fun onBufferReceived(buffer: ByteArray?) {}
+            override fun onEndOfSpeech() {}
+            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onEvent(eventType: Int, params: Bundle?) {}
+        })
+        recognizer.startListening(intent)
+    }
+
+    private fun stopListening() {
+        speechRecognizer?.destroy()
+        speechRecognizer = null
+        listening = false
+        micButton?.text = "🎤"
+    }
+
     // ---------- Shift ----------
 
-    /** What a key shows and types right now, given the shift state. */
     private fun outputFor(config: KeyConfig): String {
         if (shiftState == ShiftState.OFF) return config.label
         config.shiftLabel?.let { return it }
@@ -102,7 +220,6 @@ class MyKeyboardIME : InputMethodService() {
                         ShiftState.ONCE -> "⬆"
                         ShiftState.LOCKED -> "⇪"
                     }
-                    // Shift stays pressed-in while it's on.
                     kv.setPressedVisual(shiftState != ShiftState.OFF)
                 }
                 else -> {}
@@ -126,7 +243,6 @@ class MyKeyboardIME : InputMethodService() {
                     target.setPressedVisual(true)
                     vibrateKey()
                     if (target.config.action == KeyAction.BACKSPACE) {
-                        // Delete right away, then keep deleting while held.
                         backspaceHeld = true
                         handleTap(target.config)
                         startRepeating(400L, 45L) { handleTap(target.config) }
@@ -169,11 +285,6 @@ class MyKeyboardIME : InputMethodService() {
         return false
     }
 
-    /**
-     * Sliding on the space bar moves the cursor. Every ~16dp of finger travel
-     * moves it one character, and holding the finger off to one side keeps
-     * moving it in that direction until you let go or slide back to the middle.
-     */
     private fun handleSpaceMove(totalDx: Float, totalDy: Float, x: Float) {
         val threshold = dp(24).toFloat()
         val scrubStep = dp(16).toFloat()
@@ -254,6 +365,7 @@ class MyKeyboardIME : InputMethodService() {
                 ic.commitText(original, 1)
                 currentWord.clear()
                 currentWord.append(original)
+                autocorrectSuppressedWord = original
             } else {
                 val selected = ic.getSelectedText(0)
                 if (!selected.isNullOrEmpty()) {
@@ -277,7 +389,6 @@ class MyKeyboardIME : InputMethodService() {
                 currentWord.clear()
             }
             KeyAction.SHIFT -> {
-                // Tap once = capitalize the next letter. Tap twice quickly = caps lock.
                 val now = SystemClock.uptimeMillis()
                 shiftState = when {
                     shiftState == ShiftState.LOCKED -> ShiftState.OFF
@@ -310,7 +421,13 @@ class MyKeyboardIME : InputMethodService() {
             }
             KeyAction.SPACE -> {
                 val typed = currentWord.toString()
-                val correction = Autocorrector.correctionFor(typed)?.let { matchCase(typed, it) }
+                val suppressed = autocorrectSuppressedWord
+                autocorrectSuppressedWord = null
+                val correction = if (typed.isNotEmpty() && typed == suppressed) {
+                    null
+                } else {
+                    Autocorrector.correctionFor(typed)?.let { matchCase(typed, it) }
+                }
                 if (correction != null) {
                     ic.deleteSurroundingText(typed.length, 0)
                     ic.commitText(correction, 1)
@@ -322,7 +439,7 @@ class MyKeyboardIME : InputMethodService() {
                 currentWord.clear()
             }
             KeyAction.CHAR -> {
-                val text = outputFor(config)
+                val text = config.commitOverride ?: outputFor(config)
                 ic.commitText(text, 1)
                 if (text.length == 1 && text[0].isLetter()) {
                     currentWord.append(text)
@@ -334,7 +451,7 @@ class MyKeyboardIME : InputMethodService() {
                     refreshLabels()
                 }
             }
-            KeyAction.BACKSPACE -> {}
+            KeyAction.BACKSPACE, KeyAction.SPACER -> {}
         }
         updatePrediction()
     }
@@ -343,6 +460,7 @@ class MyKeyboardIME : InputMethodService() {
         currentInputConnection?.commitText(text, 1)
         currentWord.clear()
         pendingCorrection = null
+        autocorrectSuppressedWord = null
         updatePrediction()
     }
 
@@ -366,30 +484,31 @@ class MyKeyboardIME : InputMethodService() {
         super.onStartInputView(info, restarting)
         currentWord.clear()
         pendingCorrection = null
+        autocorrectSuppressedWord = null
         if (!restarting) {
             shiftState = ShiftState.OFF
             page = KeyboardPage.LETTERS
+            if (::keyboardContainer.isInitialized) populateKeyboard()
         }
-        // Rebuild so settings and key edits apply every time the keyboard opens.
-        if (::keyboardContainer.isInitialized) populateKeyboard()
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
         stopRepeating()
+        stopListening()
     }
 
     private fun vibrateKey() {
         val intensity = KeyboardPrefs.getHapticIntensity(this)
         if (intensity <= 0) return
-        val vibrator = getSystemService(VIBRATOR_SERVICE) as? Vibrator ?: return
+        val v = vibrator ?: return
         val durationMs = 12L
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val amplitude = ((intensity / 100f) * 255).toInt().coerceIn(1, 255)
-            vibrator.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
+            v.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
         } else {
             @Suppress("DEPRECATION")
-            vibrator.vibrate(durationMs)
+            v.vibrate(durationMs)
         }
     }
 
