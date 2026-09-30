@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.AlertDialog
 import android.graphics.Color
 import android.os.Bundle
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -18,6 +19,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.core.widget.doAfterTextChanged
 
 class KeyEditorActivity : Activity() {
 
@@ -82,6 +84,33 @@ class KeyEditorActivity : Activity() {
                 KeyboardPrefs.setShowPredictedHighlight(this, it); rebuildPreview()
             }
         )
+
+        controls.addView(
+            toggleRow("Learn from my typing", KeyboardPrefs.getLearnWords(this)) {
+                KeyboardPrefs.setLearnWords(this, it)
+            }
+        )
+        controls.addView(Button(this).apply {
+            text = "Clear learned words"
+            setOnClickListener {
+                WordPredictor.clearLearned(this@KeyEditorActivity)
+                Toast.makeText(this@KeyEditorActivity, "Learned words cleared", Toast.LENGTH_SHORT).show()
+            }
+        })
+        controls.addView(TextView(this).apply {
+            text = "GIF search (Klipy API key)"
+            textSize = 14f
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        controls.addView(EditText(this).apply {
+            hint = "Paste your key from klipy.com/developers"
+            setText(KeyboardPrefs.getKlipyKey(this@KeyEditorActivity))
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            doAfterTextChanged {
+                KeyboardPrefs.setKlipyKey(this@KeyEditorActivity, it?.toString()?.trim() ?: "")
+            }
+        })
 
         screen.addView(
             ScrollView(this).apply { addView(controls) },
