@@ -3,6 +3,16 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
+// Every build is signed with the same key, so a new version installs over the
+// old one and keeps its settings. The key is stored as text in
+// debug-keystore.b64 and unpacked here.
+def debugKeystoreB64 = file('debug-keystore.b64')
+def debugKeystoreFile = file("${layout.buildDirectory.get().asFile}/signing/debug.keystore")
+if (debugKeystoreB64.exists()) {
+    debugKeystoreFile.parentFile.mkdirs()
+    debugKeystoreFile.bytes = Base64.decoder.decode(debugKeystoreB64.readLines().collect { it.trim() }.join(''))
+}
+
 android {
     namespace 'com.example.customkeyboard'
     compileSdk 34
@@ -13,6 +23,18 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+    }
+
+    signingConfigs {
+        debug {
+            if (debugKeystoreB64.exists()) {
+                storeFile debugKeystoreFile
+                storeType 'pkcs12'
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
     }
 
     buildTypes {
