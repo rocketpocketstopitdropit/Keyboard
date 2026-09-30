@@ -29,7 +29,10 @@ object LetterPredictor {
 
         WordPredictor.predictNextChar(previousWord, lower)?.let { return it }
 
-        if (lower.isEmpty()) return null
+        // The word model had candidates but none was likely enough: stay quiet
+        // rather than guessing. The letter tables below are only for
+        // prefixes that no known word continues (names, new words).
+        if (lower.isEmpty() || WordPredictor.continues(lower)) return null
 
         if (lower.length >= 2) {
             trigramMap[lower.takeLast(2)]?.let { return it }
