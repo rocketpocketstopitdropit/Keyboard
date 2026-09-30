@@ -8,6 +8,8 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.text.TextUtils
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 
@@ -21,7 +23,15 @@ class BuiltKeyboard(
     val root: LinearLayout,
     val keys: List<KeyView>,
     val letterKeys: List<KeyView>,
-    val micButton: TextView?
+    val micButton: TextView?,
+    /** Holds the hotkeys and the suggestion strip, one on top of the other. */
+    val stripHost: FrameLayout,
+    /** The row of hotkeys (settings, GIF, emoji, clipboard, mic). */
+    val iconStrip: View,
+    /** The three word suggestions; hidden until the service shows it. */
+    val suggestionStrip: View,
+    /** Left, centre (best guess), right. */
+    val suggestionViews: List<TextView>
 )
 
 private fun offsetToRoot(rect: Rect, view: View, root: View): Rect {
@@ -55,7 +65,8 @@ object KeyboardBuilder {
         clipboardHistory: List<String> = emptyList(),
         onTap: (KeyConfig) -> Unit,
         onFlick: (KeyConfig, String) -> Unit,
-        onAccessory: (AccessoryAction) -> Unit
+        onAccessory: (AccessoryAction) -> Unit,
+        onSuggestion: (String) -> Unit = {}
     ): BuiltKeyboard {
         val dm = context.resources.displayMetrics
         fun dp(v: Int): Int =
@@ -122,7 +133,46 @@ object KeyboardBuilder {
         iconStrip.addView(accessoryIcon("📋", 1f, AccessoryAction.CLIPBOARD))
         val micButton = accessoryIcon("🎤", 1f, AccessoryAction.MIC)
         iconStrip.addView(micButton)
-        topRow.addView(iconStrip, LinearLayout.LayoutParams(0, wrapContent, 8.5f))
+
+        // The suggestion strip sits in the same spot as the hotkeys; the
+        // service swaps between them (hotkeys when idle, suggestions while
+        // a word is being typed).
+        val suggestionViews = mutableListOf<TextView>()
+        val suggestionStrip = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(4), dp(2), 0)
+            visibility = View.GONE
+        }
+        for (slot in 0 until 3) {
+            if (slot > 0) {
+                suggestionStrip.addView(
+                    View(context).apply { setBackgroundColor(Color.argb(70, 255, 255, 255)) },
+                    LinearLayout.LayoutParams(dp(1), dp(20))
+                )
+            }
+            val tv = TextView(context).apply {
+                textSize = 16f
+                gravity = Gravity.CENTER
+                setTextColor(Color.WHITE)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(dp(4), 0, dp(4), 0)
+                isClickable = true
+                layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f)
+                setOnClickListener {
+                    val word = text.toString()
+                    if (word.isNotEmpty()) onSuggestion(word)
+                }
+            }
+            suggestionViews.add(tv)
+            suggestionStrip.addView(tv)
+        }
+
+        val stripHost = FrameLayout(context)
+        stripHost.addView(iconStrip, FrameLayout.LayoutParams(matchParent, wrapContent))
+        stripHost.addView(suggestionStrip, FrameLayout.LayoutParams(matchParent, wrapContent))
+        topRow.addView(stripHost, LinearLayout.LayoutParams(0, wrapContent, 8.5f))
 
         val tab = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
@@ -227,6 +277,6 @@ object KeyboardBuilder {
             KeyboardPage.CLIPBOARD -> clipboardRows().forEach { addRow(it, null) }
         }
 
-        return BuiltKeyboard(root, keys, letterKeys, micButton)
+        return BuiltKeyboard(root, keys, letterKeys, micButton, stripHost, iconStrip, suggestionStrip, suggestionViews)
     }
 }
