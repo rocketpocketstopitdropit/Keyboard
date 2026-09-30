@@ -59,6 +59,9 @@ class KeyView(
 
     var displayLabel: String = config.label
         set(value) {
+            // Rewriting identical text still forces a layout pass, which adds
+            // up when every key is refreshed after each capital letter.
+            if (field == value) return
             field = value
             centerLabel.text = value
         }
@@ -205,3 +208,4 @@ class KeyView(
         if (corner != null) onFlick(config, corner) else onTap(config)
     }
 }
+
