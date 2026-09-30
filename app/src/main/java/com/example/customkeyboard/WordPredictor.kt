@@ -300,9 +300,23 @@ object WordPredictor {
         val userTotal: Double
     )
 
+    private var cachedPrev: String? = null
+    private var cachedVersion = -1
+    private var cachedContext: PredictionContext? = null
+
+    /** One keystroke asks for this several times with the same inputs, so remember the last answer. */
     private fun contextFor(previous: String): PredictionContext {
         val prev = normalize(previous)
+        val cached = cachedContext
+        if (cached != null && cachedPrev == prev && cachedVersion == user.dataVersion) return cached
+        val built = buildContext(prev)
+        cachedPrev = prev
+        cachedVersion = user.dataVersion
+        cachedContext = built
+        return built
+    }
 
+    private fun buildContext(prev: String): PredictionContext {
         val curatedRaw = bigrams[prev]
         val curated: Map<String, Double> = if (curatedRaw == null) {
             emptyMap()
@@ -461,3 +475,4 @@ object WordPredictor {
     fun clearLearned(context: Context) = user.clear(context.applicationContext)
 
 }
+
