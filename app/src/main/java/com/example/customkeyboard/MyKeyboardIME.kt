@@ -9,7 +9,9 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.graphics.Rect
 import android.os.SystemClock
+import android.util.SparseArray
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.speech.RecognitionListener
@@ -59,9 +61,6 @@ class MyKeyboardIME : InputMethodService() {
     private var suggestionViews: List<TextView> = emptyList()
 
     private var predictedKeyView: KeyView? = null
-    private var activeKeyView: KeyView? = null
-    private var downX = 0f
-    private var downY = 0f
 
     private val currentWord = StringBuilder()
     private var previousWord: String = WordPredictor.START
@@ -73,10 +72,27 @@ class MyKeyboardIME : InputMethodService() {
 
     private val uiHandler = Handler(Looper.getMainLooper())
     private var repeatRunnable: Runnable? = null
-    private var backspaceHeld = false
-    private var spaceSlideActive = false
-    private var spaceSlideDir = 0
-    private var lastScrubX = 0f
+
+    // Double-space period and auto-capitalization state.
+    private var spaceAfterWord = false
+    private var lastSpaceTime = 0L
+    private var lastCharWordish = false
+    private var sentenceEndPending = false
+    private var shiftIsAuto = false
+    private var autoCapAllowed = true
+    private var autoPeriodAllowed = true
+    private val doubleSpaceMs = 500L
+
+    // Where the selection is, kept up to date by the system so backspace never has to ask the app.
+    private var selStart = 0
+    private var selEnd = 0
+
+    // Predictions can wait for a pause in typing; the keys can't.
+    private val predictionRunnable = Runnable { updatePredictionNow() }
+    private val predictionDelayMs = 50L
+
+    private var hapticLevel = -1
+    private var hapticEffect: Any? = null
 
     private val vibrator: Vibrator? by lazy { getSystemService(VIBRATOR_SERVICE) as? Vibrator }
     private val clipboardManager: ClipboardManager by lazy {
@@ -113,7 +129,8 @@ class MyKeyboardIME : InputMethodService() {
         stopRepeating()
         keyboardContainer.removeAllViews()
         predictedKeyView = null
-        activeKeyView = null
+        cancelAllTouches()
+        keyRects = null
 
         val built = KeyboardBuilder.build(
             context = this,
@@ -125,6 +142,7 @@ class MyKeyboardIME : InputMethodService() {
             onSuggestion = { word -> onSuggestionTapped(word) }
         )
         built.root.setOnTouchListener { _, event -> handleTouch(event) }
+        built.root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> keyRects = null }
         keyboardContainer.addView(
             built.root,
             FrameLayout.LayoutParams(
@@ -528,85 +546,151 @@ class MyKeyboardIME : InputMethodService() {
 
     // ---------- Touch handling ----------
 
-    private fun handleTouch(event: MotionEvent): Boolean {
-        when (event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                downX = event.x
-                downY = event.y
-                spaceSlideActive = false
-                spaceSlideDir = 0
-                backspaceHeld = false
-                val target = resolveKeyAt(event.x.toInt(), event.y.toInt())
-                activeKeyView = target
-                if (target != null) {
-                    target.setPressedVisual(true)
-                    vibrateKey()
-                    if (target.config.action == KeyAction.BACKSPACE) {
-                        backspaceHeld = true
-                        handleTap(target.config)
-                        startRepeating(400L, 45L) { handleTap(target.config) }
-                    }
-                }
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                val target = activeKeyView
-                if (target != null && target.config.action == KeyAction.SPACE) {
-                    handleSpaceMove(event.x - downX, event.y - downY, event.x)
-                }
-                return true
-            }
-            MotionEvent.ACTION_UP -> {
-                val target = activeKeyView
-                activeKeyView = null
-                stopRepeating()
-                when {
-                    target == null -> {}
-                    backspaceHeld -> target.setPressedVisual(false)
-                    spaceSlideActive -> target.setPressedVisual(false)
-                    else -> target.resolveGesture(event.x - downX, event.y - downY)
-                }
-                backspaceHeld = false
-                spaceSlideActive = false
-                spaceSlideDir = 0
-                return true
-            }
-            MotionEvent.ACTION_CANCEL -> {
-                stopRepeating()
-                activeKeyView?.setPressedVisual(false)
-                activeKeyView = null
-                backspaceHeld = false
-                spaceSlideActive = false
-                spaceSlideDir = 0
-                return true
-            }
-        }
-        return false
+    /** What one finger is doing. Fingers are tracked separately so overlapping taps in fast typing all count. */
+    private class TouchState(val key: KeyView?, val downX: Float, val downY: Float) {
+        /** Space bar only: -1 / +1 once it has become a cursor gesture. */
+        var slideDir = 0
+        var spaceGesture = false
+        var backspace = false
     }
 
-    private fun handleSpaceMove(totalDx: Float, totalDy: Float, x: Float) {
-        val threshold = dp(24).toFloat()
-        val scrubStep = dp(16).toFloat()
+    private val touches = SparseArray<TouchState>()
+    private var keyRects: List<Pair<KeyView, Rect>>? = null
+    private var repeatOwner = -1
+    private var holdRunnable: Runnable? = null
 
-        if (!spaceSlideActive) {
-            if (abs(totalDx) < threshold || abs(totalDx) < abs(totalDy)) return
-            spaceSlideActive = true
-            lastScrubX = x
-            moveCursor(if (totalDx > 0) 1 else -1)
+    private fun handleTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val i = event.actionIndex
+                pointerDown(event.getPointerId(i), event.getX(i), event.getY(i))
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (i in 0 until event.pointerCount) {
+                    pointerMove(event.getPointerId(i), event.getX(i), event.getY(i))
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val i = event.actionIndex
+                pointerUp(event.getPointerId(i), event.getX(i), event.getY(i))
+            }
+            MotionEvent.ACTION_CANCEL -> cancelAllTouches()
         }
+        return true
+    }
 
-        while (abs(x - lastScrubX) >= scrubStep) {
-            val stepDir = if (x > lastScrubX) 1 else -1
-            moveCursor(stepDir)
-            lastScrubX += stepDir * scrubStep
+    private fun pointerDown(id: Int, x: Float, y: Float) {
+        val target = resolveKeyAt(x.toInt(), y.toInt())
+        val state = TouchState(target, x, y)
+        touches.put(id, state)
+        if (target == null) return
+        target.setPressedVisual(true)
+        vibrateKey()
+        when (target.config.action) {
+            KeyAction.BACKSPACE -> {
+                state.backspace = true
+                handleTap(target.config)
+                startRepeating(400L, 45L) { handleTap(target.config) }
+                repeatOwner = id
+            }
+            KeyAction.SPACE -> scheduleSpaceHold(id)
+            else -> {}
         }
+    }
 
-        val dir = if (abs(totalDx) >= threshold) (if (totalDx > 0) 1 else -1) else 0
-        if (dir != spaceSlideDir) {
-            spaceSlideDir = dir
-            if (dir == 0) stopRepeating()
-            else startRepeating(350L, 70L) { moveCursor(spaceSlideDir) }
+    private fun pointerMove(id: Int, x: Float, y: Float) {
+        val state = touches.get(id) ?: return
+        val key = state.key ?: return
+        if (key.config.action != KeyAction.SPACE || state.spaceGesture) return
+        val dx = x - state.downX
+        val dy = y - state.downY
+        // A flick along the space bar moves the cursor exactly one character.
+        if (abs(dx) >= dp(24) && abs(dx) > abs(dy)) {
+            state.slideDir = if (dx > 0) 1 else -1
+            state.spaceGesture = true
+            moveCursor(state.slideDir)
+            // Keep holding after the flick and it keeps going, getting faster.
+            scheduleSpaceHold(id)
         }
+    }
+
+    private fun pointerUp(id: Int, x: Float, y: Float) {
+        val state = touches.get(id) ?: return
+        touches.remove(id)
+        if (repeatOwner == id) {
+            stopRepeating()
+            repeatOwner = -1
+        }
+        holdRunnable?.let { uiHandler.removeCallbacks(it) }
+        holdRunnable = null
+        val key = state.key ?: return
+        when {
+            state.backspace -> key.setPressedVisual(false)
+            state.spaceGesture -> {
+                key.setPressedVisual(false)
+                refreshAutoCap()
+            }
+            else -> key.resolveGesture(x - state.downX, y - state.downY)
+        }
+    }
+
+    private fun cancelAllTouches() {
+        stopRepeating()
+        repeatOwner = -1
+        holdRunnable?.let { uiHandler.removeCallbacks(it) }
+        holdRunnable = null
+        for (i in 0 until touches.size()) touches.valueAt(i).key?.setPressedVisual(false)
+        touches.clear()
+    }
+
+    /** After a short hold on the space bar, start moving the cursor continuously. */
+    private fun scheduleSpaceHold(id: Int) {
+        holdRunnable?.let { uiHandler.removeCallbacks(it) }
+        val r = Runnable { beginSpaceHold(id) }
+        holdRunnable = r
+        uiHandler.postDelayed(r, 400L)
+    }
+
+    private fun beginSpaceHold(id: Int) {
+        val state = touches.get(id) ?: return
+        // After a flick the hold continues that way; otherwise it goes toward
+        // whichever end of the space bar the finger is on (the middle stays a space).
+        val dir = if (state.slideDir != 0) state.slideDir else spaceSide(state)
+        if (dir == 0) return
+        state.spaceGesture = true
+        state.slideDir = dir
+        startCursorRepeat(dir)
+        repeatOwner = id
+    }
+
+    private fun spaceSide(state: TouchState): Int {
+        val root = builtRoot ?: return 0
+        val key = state.key ?: return 0
+        val rect = key.rawHitRectIn(root)
+        if (rect.width() <= 0) return 0
+        val fraction = (state.downX - rect.left) / rect.width().toFloat()
+        return when {
+            fraction < 0.3f -> -1
+            fraction > 0.7f -> 1
+            else -> 0
+        }
+    }
+
+    /** Moves the cursor over and over, speeding up the longer the space bar is held. */
+    private fun startCursorRepeat(dir: Int) {
+        stopRepeating()
+        val startedAt = SystemClock.uptimeMillis()
+        val r = object : Runnable {
+            override fun run() {
+                moveCursor(dir)
+                val held = SystemClock.uptimeMillis() - startedAt
+                // 180 ms between steps at first, easing down to 20 ms after about three seconds.
+                val interval = (180L - held / 18L).coerceIn(20L, 180L)
+                uiHandler.postDelayed(this, interval)
+            }
+        }
+        repeatRunnable = r
+        uiHandler.post(r)
     }
 
     private fun moveCursor(dir: Int) {
@@ -617,6 +701,9 @@ class MyKeyboardIME : InputMethodService() {
         currentWord.clear()
         previousWord = ""
         pendingCorrection = null
+        spaceAfterWord = false
+        sentenceEndPending = false
+        lastCharWordish = false
         updatePrediction()
     }
 
@@ -639,7 +726,15 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun resolveKeyAt(x: Int, y: Int): KeyView? {
         val root = builtRoot ?: return null
-        allKeys.firstOrNull { it.rawHitRectIn(root).contains(x, y) }?.let { return it }
+        // Key positions only change when the layout does, so measure them once per layout.
+        var rects = keyRects
+        if (rects == null) {
+            rects = allKeys.map { it to it.rawHitRectIn(root) }
+            keyRects = rects
+        }
+        for ((key, rect) in rects) {
+            if (rect.contains(x, y)) return key
+        }
         predictedKeyView?.let { predicted ->
             if (predicted.hitRectIn(root).contains(x, y)) return predicted
         }
@@ -659,6 +754,9 @@ class MyKeyboardIME : InputMethodService() {
         val ic = currentInputConnection ?: return
 
         if (config.action == KeyAction.BACKSPACE) {
+            spaceAfterWord = false
+            sentenceEndPending = false
+            lastCharWordish = false
             val pending = pendingCorrection
             pendingCorrection = null
             if (pending != null) {
@@ -673,9 +771,11 @@ class MyKeyboardIME : InputMethodService() {
                 if (learningAllowed) WordPredictor.unlearn(pendingCorrectionPrev, corrected)
                 previousWord = pendingCorrectionPrev
             } else {
-                val selected = ic.getSelectedText(0)
-                if (!selected.isNullOrEmpty()) {
+                // selStart/selEnd are kept current by onUpdateSelection, so there's no
+                // blocking question to the app on every backspace.
+                if (selStart != selEnd && selStart >= 0 && selEnd >= 0) {
                     ic.commitText("", 1)
+                    selEnd = selStart
                     currentWord.clear()
                 } else {
                     ic.deleteSurroundingText(1, 0)
@@ -687,6 +787,7 @@ class MyKeyboardIME : InputMethodService() {
         }
 
         pendingCorrection = null
+        if (config.action != KeyAction.SPACE) spaceAfterWord = false
 
         when (config.action) {
             KeyAction.ENTER -> {
@@ -694,8 +795,12 @@ class MyKeyboardIME : InputMethodService() {
                 ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
                 finishWord(currentWord.toString(), 1f)
                 previousWord = WordPredictor.START
+                sentenceEndPending = false
+                lastCharWordish = false
+                autoShift()
             }
             KeyAction.SHIFT -> {
+                shiftIsAuto = false
                 val now = SystemClock.uptimeMillis()
                 shiftState = when {
                     shiftState == ShiftState.LOCKED -> ShiftState.OFF
@@ -727,6 +832,20 @@ class MyKeyboardIME : InputMethodService() {
                 return
             }
             KeyAction.SPACE -> {
+                val now = SystemClock.uptimeMillis()
+                if (autoPeriodAllowed && spaceAfterWord && currentWord.isEmpty() &&
+                    now - lastSpaceTime <= doubleSpaceMs
+                ) {
+                    // A second quick tap on the space bar turns "word " into "word. ".
+                    ic.deleteSurroundingText(1, 0)
+                    ic.commitText(". ", 1)
+                    spaceAfterWord = false
+                    lastCharWordish = false
+                    previousWord = WordPredictor.START
+                    autoShift()
+                    updatePrediction()
+                    return
+                }
                 val typed = currentWord.toString()
                 val suppressed = autocorrectSuppressedWord
                 autocorrectSuppressedWord = null
@@ -748,7 +867,15 @@ class MyKeyboardIME : InputMethodService() {
                 } else {
                     ic.commitText(" ", 1)
                 }
+                val hadWord = typed.isNotEmpty() || lastCharWordish
                 finishWord(correction ?: typed, if (rejected) 3f else 1f)
+                spaceAfterWord = hadWord
+                lastSpaceTime = now
+                lastCharWordish = false
+                if (sentenceEndPending) {
+                    sentenceEndPending = false
+                    autoShift()
+                }
             }
             KeyAction.CHAR -> {
                 val text = config.commitOverride ?: outputFor(config)
@@ -764,8 +891,11 @@ class MyKeyboardIME : InputMethodService() {
                         previousWord = WordPredictor.START
                     }
                 }
+                lastCharWordish = text.length == 1 && text[0].isLetterOrDigit()
+                sentenceEndPending = text.length == 1 && (text[0] == '.' || text[0] == '!' || text[0] == '?')
                 if (shiftState == ShiftState.ONCE) {
                     shiftState = ShiftState.OFF
+                    shiftIsAuto = false
                     refreshLabels()
                 }
             }
@@ -784,6 +914,9 @@ class MyKeyboardIME : InputMethodService() {
         }
         currentInputConnection?.commitText(text, 1)
         finishWord(currentWord.toString(), 1f)
+        spaceAfterWord = false
+        lastCharWordish = false
+        sentenceEndPending = false
         pendingCorrection = null
         autocorrectSuppressedWord = null
         updatePrediction()
@@ -833,6 +966,8 @@ class MyKeyboardIME : InputMethodService() {
 
         learningAllowed = isText && !isPassword && !optedOut && KeyboardPrefs.getLearnWords(this)
         autocorrectAllowed = isText && !isPassword && !isStructured && !noSuggestions
+        autoCapAllowed = autocorrectAllowed && KeyboardPrefs.getAutoCapitalize(this)
+        autoPeriodAllowed = autocorrectAllowed && KeyboardPrefs.getDoubleSpacePeriod(this)
     }
 
     /**
@@ -885,10 +1020,44 @@ class MyKeyboardIME : InputMethodService() {
         pendingCorrectionPrev = previousWord
         autocorrectSuppressedWord = null
         finishWord(word, 1f)
+        // A space was committed with the word, so a quick second space can still make a period.
+        spaceAfterWord = true
+        lastSpaceTime = SystemClock.uptimeMillis()
+        lastCharWordish = false
         updatePrediction()
     }
 
+    /** Runs shortly after the last keystroke, so fast typing never waits on it. */
     private fun updatePrediction() {
+        uiHandler.removeCallbacks(predictionRunnable)
+        uiHandler.postDelayed(predictionRunnable, predictionDelayMs)
+    }
+
+    // ---------- Auto-capitalize ----------
+
+    /** Shift on for the next letter, unless shift is already on or locked. */
+    private fun autoShift() {
+        if (!autoCapAllowed || shiftState != ShiftState.OFF) return
+        shiftState = ShiftState.ONCE
+        shiftIsAuto = true
+        refreshLabels()
+    }
+
+    /** Ask the app once whether the cursor sits at the start of a sentence. */
+    private fun refreshAutoCap() {
+        if (!autoCapAllowed || gifMode) return
+        val ic = currentInputConnection ?: return
+        val atSentenceStart = ic.getCursorCapsMode(InputType.TYPE_TEXT_FLAG_CAP_SENTENCES) != 0
+        if (atSentenceStart) {
+            autoShift()
+        } else if (shiftIsAuto && shiftState == ShiftState.ONCE) {
+            shiftState = ShiftState.OFF
+            shiftIsAuto = false
+            refreshLabels()
+        }
+    }
+
+    private fun updatePredictionNow() {
         updateSuggestions()
         predictedKeyView?.isPredicted = false
         predictedKeyView = null
@@ -912,33 +1081,61 @@ class MyKeyboardIME : InputMethodService() {
         pendingCorrection = null
         autocorrectSuppressedWord = null
         previousWord = WordPredictor.START
+        spaceAfterWord = false
+        lastCharWordish = false
+        sentenceEndPending = false
+        selStart = info?.initialSelStart ?: 0
+        selEnd = info?.initialSelEnd ?: 0
         applyFieldPolicy(info)
+        loadHaptics()
         if (!restarting) {
             shiftState = ShiftState.OFF
+            shiftIsAuto = false
             page = KeyboardPage.LETTERS
             if (::keyboardContainer.isInitialized) populateKeyboard()
         }
+        refreshAutoCap()
         updateSuggestions()
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int,
+        newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int
+    ) {
+        super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
+        selStart = newSelStart
+        selEnd = newSelEnd
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
         super.onFinishInputView(finishingInput)
-        stopRepeating()
+        cancelAllTouches()
+        uiHandler.removeCallbacks(predictionRunnable)
         stopListening()
         WordPredictor.flush()
     }
 
+    private fun loadHaptics() {
+        hapticLevel = KeyboardPrefs.getHapticIntensity(this)
+        hapticEffect = if (hapticLevel > 0 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val amplitude = ((hapticLevel / 100f) * 255).toInt().coerceIn(1, 255)
+            VibrationEffect.createOneShot(12L, amplitude)
+        } else {
+            null
+        }
+    }
+
     private fun vibrateKey() {
-        val intensity = KeyboardPrefs.getHapticIntensity(this)
-        if (intensity <= 0) return
+        if (hapticLevel < 0) loadHaptics()
+        if (hapticLevel <= 0) return
         val v = vibrator ?: return
-        val durationMs = 12L
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val amplitude = ((intensity / 100f) * 255).toInt().coerceIn(1, 255)
-            v.vibrate(VibrationEffect.createOneShot(durationMs, amplitude))
+        val effect = hapticEffect
+        if (effect != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            v.vibrate(effect as VibrationEffect)
         } else {
             @Suppress("DEPRECATION")
-            v.vibrate(durationMs)
+            v.vibrate(12L)
         }
     }
 
@@ -947,4 +1144,3 @@ class MyKeyboardIME : InputMethodService() {
             TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
         ).toInt()
 }
-
