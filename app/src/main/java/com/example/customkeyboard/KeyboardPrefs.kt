@@ -11,6 +11,8 @@ object KeyboardPrefs {
     private const val HAPTIC_INTENSITY = "haptic_intensity"
     private const val SHOW_PREDICTED_HIGHLIGHT = "show_predicted_highlight"
     private const val SHOW_NUMBER_ROW = "show_number_row"
+    private const val LEARN_WORDS = "learn_words"
+    private const val KLIPY_KEY = "klipy_api_key"
 
     const val DEFAULT_HEIGHT = 52
     const val DEFAULT_KEY_WIDTH = 100
@@ -19,6 +21,7 @@ object KeyboardPrefs {
     const val DEFAULT_HAPTIC_INTENSITY = 40
     const val DEFAULT_SHOW_PREDICTED_HIGHLIGHT = false
     const val DEFAULT_SHOW_NUMBER_ROW = false
+    const val DEFAULT_LEARN_WORDS = true
 
     private fun prefs(context: Context) =
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -51,4 +54,16 @@ object KeyboardPrefs {
         prefs(context).getBoolean(SHOW_NUMBER_ROW, DEFAULT_SHOW_NUMBER_ROW)
     fun setShowNumberRow(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(SHOW_NUMBER_ROW, value).apply()
+
+    // Whether the keyboard learns words and word pairs from what's typed.
+    fun getLearnWords(context: Context): Boolean =
+        prefs(context).getBoolean(LEARN_WORDS, DEFAULT_LEARN_WORDS)
+    fun setLearnWords(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(LEARN_WORDS, value).apply()
+
+    // API key for GIF search (Klipy). Empty until the person adds one.
+    fun getKlipyKey(context: Context): String =
+        prefs(context).getString(KLIPY_KEY, "") ?: ""
+    fun setKlipyKey(context: Context, value: String) =
+        prefs(context).edit().putString(KLIPY_KEY, value).apply()
 }
