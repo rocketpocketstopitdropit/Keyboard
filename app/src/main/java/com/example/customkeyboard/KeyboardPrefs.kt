@@ -12,6 +12,8 @@ object KeyboardPrefs {
     private const val SHOW_PREDICTED_HIGHLIGHT = "show_predicted_highlight"
     private const val SHOW_NUMBER_ROW = "show_number_row"
     private const val LEARN_WORDS = "learn_words"
+    private const val AUTO_CAPITALIZE = "auto_capitalize"
+    private const val DOUBLE_SPACE_PERIOD = "double_space_period"
     private const val KLIPY_KEY = "klipy_api_key"
 
     const val DEFAULT_HEIGHT = 52
@@ -60,6 +62,18 @@ object KeyboardPrefs {
         prefs(context).getBoolean(LEARN_WORDS, DEFAULT_LEARN_WORDS)
     fun setLearnWords(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(LEARN_WORDS, value).apply()
+
+    // Capitalize the first letter of each new sentence.
+    fun getAutoCapitalize(context: Context): Boolean =
+        prefs(context).getBoolean(AUTO_CAPITALIZE, true)
+    fun setAutoCapitalize(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(AUTO_CAPITALIZE, value).apply()
+
+    // Two quick taps on the space bar type ". " in place of "  ".
+    fun getDoubleSpacePeriod(context: Context): Boolean =
+        prefs(context).getBoolean(DOUBLE_SPACE_PERIOD, true)
+    fun setDoubleSpacePeriod(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(DOUBLE_SPACE_PERIOD, value).apply()
 
     // API key for GIF search (Klipy). Empty until the person adds one.
     fun getKlipyKey(context: Context): String =
