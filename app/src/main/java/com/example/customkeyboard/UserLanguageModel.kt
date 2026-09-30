@@ -26,6 +26,10 @@ class UserLanguageModel {
     var vocabularyVersion = 0
         private set
 
+    /** Bumped on every change to the counts, so cached probabilities can be refreshed. */
+    var dataVersion = 0
+        private set
+
     private var file: File? = null
 
     fun load(context: Context) {
@@ -53,6 +57,7 @@ class UserLanguageModel {
         }
         unigramTotal = unigrams.values.sum()
         vocabularyVersion++
+        dataVersion++
     }
 
     fun unigramCount(word: String): Float = unigrams[word] ?: 0f
@@ -66,6 +71,7 @@ class UserLanguageModel {
         unigrams.entries.filter { it.value >= KNOWN_THRESHOLD }.map { it.key }
 
     fun learn(previous: String, word: String, weight: Float) {
+        dataVersion++
         val wasKnown = isKnown(word)
         unigrams[word] = (unigrams[word] ?: 0f) + weight
         unigramTotal += weight
@@ -79,6 +85,7 @@ class UserLanguageModel {
 
     /** Reverse a learn() — used when the person undoes an autocorrection. */
     fun unlearn(previous: String, word: String, weight: Float) {
+        dataVersion++
         val wasKnown = isKnown(word)
         val c = unigrams[word]
         if (c != null) {
@@ -104,6 +111,7 @@ class UserLanguageModel {
         bigrams.clear()
         unigramTotal = 0f
         vocabularyVersion++
+        dataVersion++
         val f = file ?: File(context.filesDir, FILE_NAME)
         writer.execute { try { f.delete() } catch (e: Exception) { } }
     }
@@ -157,6 +165,7 @@ class UserLanguageModel {
         }
         unigramTotal = unigrams.values.sum()
         vocabularyVersion++
+        dataVersion++
     }
 
     private fun save() {
