@@ -1,18 +1,45 @@
 package com.example.customkeyboard
 
+import android.content.Context
+import kotlin.math.ln
+
 /**
- * A hand-built approximation of the classic (pre-iOS 17) iPhone predictive
- * model, as its original author (Ken Kocienda) has described it: a
- * statistical word-frequency model plus short word-sequence context,
- * combined with a keyboard-aware touch model (see Autocorrector). There's
- * no tooling here to train this on a real text corpus, so it isn't
- * corpus-derived — but it follows the same shape: word frequency modeled
- * via Zipf's law (frequency falls off as 1/rank, the real mathematical
- * pattern word frequency follows in natural language) over a hand-ranked
- * word list, plus a hand-curated table of "previous word -> likely next
- * word" pairs for the words with the most distinctive continuations.
+ * Word model: a hand-built prior (Zipf-ranked word list plus a curated
+ * table of "previous word -> likely next word" pairs) blended with what
+ * the keyboard has learned from the person's own typing
+ * (see [UserLanguageModel]).
+ *
+ * For any word w after previous word p:
+ *
+ *   unigram(w)   = (1 - a) * zipf(w) + a * userFrequency(w)
+ *   bigram(w|p)  = (1 - b) * curated(w|p) + b * userBigram(w|p)
+ *   P(w | p)     = L * bigram(w|p) + (1 - L) * unigram(w)
+ *
+ * where a and b grow as the person types more (so a brand-new install
+ * behaves like the old fixed model, and a well-used one is personal), and
+ * L is 0 when nothing is known about p.
+ *
+ * Drop a ranked word list (one word per line, most common first, optional
+ * tab-separated count column that is ignored) at app/src/main/assets/wordlist.txt
+ * and it is appended after the built-in list automatically.
  */
 object WordPredictor {
+
+    /** Previous-word marker for "start of a message or sentence". */
+    const val START = "<s>"
+
+    private const val MAX_WORD_LEN = 24
+    private const val BIGRAM_WEIGHT = 0.7
+    private const val MAX_USER_UNIGRAM_WEIGHT = 0.6
+    private const val UNIGRAM_TRUST_SCALE = 300.0
+    private const val BIGRAM_TRUST_SCALE = 2.0
+    private const val FLOOR = 1e-7
+
+    /** A highlighted key must be at least this likely, or nothing is highlighted. */
+    private const val MIN_CONFIDENCE = 0.3
+
+    private val LN_FLOOR = ln(1e-6)
+    private val LN_CEIL = ln(0.2)
 
     // Ranked roughly by everyday-texting frequency, most common first.
     val WORDS: List<String> = listOf(
@@ -99,23 +126,23 @@ object WordPredictor {
         "dark","bright","beautiful","ugly","pretty","handsome",
         "tall","am","should","said","sounds","care",
         "trying","wanted","worries","course","case","least",
-        "luck","birthday","name"
+        "luck","birthday","name",
+        // Contractions, so they can be predicted and never "corrected" away.
+        "i'm","can't","it's","that's","i'll","i've","i'd","we're","they're","you're",
+        "won't","didn't","doesn't","isn't","wasn't","couldn't","wouldn't","shouldn't",
+        "haven't","hasn't","aren't","weren't","what's","there's","he's","she's","who's","how's",
+        // Texting staples that are real words to the people typing them.
+        "their","yo","ya","lol","omg","btw","idk","tbh","brb","imo","asap","wow","ugh","haha",
+        "lmao","yay","oops","dude","bro","mom","dad","babe","cuz","tho","thru","ima"
     )
-
-    // Zipf's law: frequency(word) ~ 1 / rank. Real word frequencies in any
-    // language follow this curve closely — a few words are extremely
-    // common, and frequency drops off sharply after that.
-    private val frequency: Map<String, Double> by lazy {
-        WORDS.withIndex().associate { (i, w) -> w to 1.0 / (i + 1) }
-    }
-
-    fun frequencyOf(word: String): Double = frequency[word.lowercase()] ?: 0.0
 
     // The bigram half of the model: only words with a genuinely
     // distinctive next-word pattern are listed — everything else just
     // falls back to plain word frequency, which is the honest,
     // conservative thing to do when there's no strong signal either way.
     private val bigrams: Map<String, List<Pair<String, Double>>> = mapOf(
+        // START = the beginning of a message or sentence.
+        "<s>" to listOf("i" to 1.0,"the" to 0.6,"hey" to 0.6,"thanks" to 0.5,"what" to 0.5,"how" to 0.5,"yeah" to 0.5,"ok" to 0.4,"hi" to 0.4,"we" to 0.4,"lol" to 0.3,"can" to 0.3,"do" to 0.3,"thank" to 0.3,"good" to 0.3),
         "i" to listOf("am" to 1.0,"have" to 0.9,"think" to 0.8,"was" to 0.75,"want" to 0.7,"need" to 0.65,"don't" to 0.6,"just" to 0.55,"love" to 0.5),
         "you" to listOf("are" to 1.0,"know" to 0.8,"can" to 0.75,"want" to 0.6,"have" to 0.6,"should" to 0.5,"just" to 0.45),
         "we" to listOf("are" to 1.0,"can" to 0.8,"should" to 0.7,"have" to 0.65,"need" to 0.6,"will" to 0.55,"were" to 0.5),
@@ -165,31 +192,272 @@ object WordPredictor {
         "please" to listOf("let" to 0.5,"call" to 0.4,"send" to 0.4)
     )
 
-    /**
-     * Best whole-word candidate for what's being typed, combining word
-     * frequency with the previous word's likely continuations. Returns
-     * null if nothing in the list matches the prefix at all.
-     */
-    fun predictNextWord(previousWord: String, prefix: String): String? {
-        val lowerPrefix = prefix.lowercase()
-        val continuations = bigrams[previousWord.lowercase()].orEmpty().toMap()
+    // ---------- state ----------
 
+    private var appContext: Context? = null
+    private val user = UserLanguageModel()
+
+    private var staticWords: List<String> = WORDS
+    private var rank: Map<String, Int> = buildRank(WORDS)
+    private var harmonic: Double = harmonicSum(WORDS.size)
+
+    private var vocabCache: List<String> = WORDS
+    private var vocabVersion = -1
+
+    /** Call once from the keyboard service; safe to call again. */
+    fun init(context: Context) {
+        if (appContext != null) return
+        val app = context.applicationContext
+        appContext = app
+        loadAssetWords(app)
+        user.load(app)
+        vocabVersion = -1
+    }
+
+    private fun buildRank(words: List<String>): Map<String, Int> {
+        val m = HashMap<String, Int>(words.size * 2)
+        for ((i, w) in words.withIndex()) if (!m.containsKey(w)) m[w] = i
+        return m
+    }
+
+    private fun harmonicSum(n: Int): Double {
+        var s = 0.0
+        for (i in 1..n) s += 1.0 / i
+        return s
+    }
+
+    private fun loadAssetWords(context: Context) {
+        try {
+            val lines = context.assets.open("wordlist.txt").bufferedReader().use { it.readLines() }
+            val merged = LinkedHashSet<String>(WORDS)
+            for (line in lines) {
+                val w = normalize(line.substringBefore('\t').trim())
+                if (isLearnable(w)) merged.add(w)
+            }
+            staticWords = merged.toList()
+        } catch (e: Exception) {
+            staticWords = WORDS
+        }
+        rank = buildRank(staticWords)
+        harmonic = harmonicSum(staticWords.size)
+    }
+
+    // ---------- text hygiene ----------
+
+    fun normalize(word: String): String = word.lowercase().replace('\u2019', '\'')
+
+    /** Only plain words (letters, with an inner apostrophe) are worth learning. */
+    private fun isLearnable(w: String): Boolean {
+        if (w.isEmpty() || w.length > MAX_WORD_LEN) return false
+        for ((i, c) in w.withIndex()) {
+            if (c == '\'') {
+                if (i == 0 || i == w.length - 1) return false
+            } else if (!c.isLetter()) {
+                return false
+            }
+        }
+        // Three of the same letter in a row ("sooo") is emphasis, not a word.
+        for (i in 2 until w.length) {
+            if (w[i] == w[i - 1] && w[i] == w[i - 2]) return false
+        }
+        return true
+    }
+
+    // ---------- vocabulary ----------
+
+    /** Built-in words plus any word the person has used often enough to trust. */
+    fun vocabulary(): List<String> {
+        if (vocabVersion != user.vocabularyVersion) {
+            val merged = ArrayList<String>(staticWords)
+            for (w in user.knownWords()) if (!rank.containsKey(w)) merged.add(w)
+            vocabCache = merged
+            vocabVersion = user.vocabularyVersion
+        }
+        return vocabCache
+    }
+
+    /** True if at least one known word starts with [prefix]. */
+    fun continues(prefix: String): Boolean {
+        val p = normalize(prefix)
+        for (w in vocabulary()) if (w.startsWith(p)) return true
+        return false
+    }
+
+    fun isKnown(word: String): Boolean {
+        val w = normalize(word)
+        return rank.containsKey(w) || user.isKnown(w)
+    }
+
+    // ---------- probability ----------
+
+    private class PredictionContext(
+        val curated: Map<String, Double>,
+        val userRow: Map<String, Float>?,
+        val userRowTotal: Double,
+        val beta: Double,
+        val lambda: Double,
+        val alpha: Double,
+        val userTotal: Double
+    )
+
+    private fun contextFor(previous: String): PredictionContext {
+        val prev = normalize(previous)
+
+        val curatedRaw = bigrams[prev]
+        val curated: Map<String, Double> = if (curatedRaw == null) {
+            emptyMap()
+        } else {
+            val sum = curatedRaw.sumOf { it.second }
+            curatedRaw.associate { it.first to it.second / sum }
+        }
+
+        val row = user.bigramRow(prev)
+        val rowTotal = row?.values?.sum()?.toDouble() ?: 0.0
+        val beta = if (rowTotal > 0.0) minOf(0.9, rowTotal / (rowTotal + BIGRAM_TRUST_SCALE)) else 0.0
+        val hasEvidence = curated.isNotEmpty() || rowTotal > 0.0
+
+        val total = user.unigramTotal().toDouble()
+        val alpha = if (total > 0.0) minOf(MAX_USER_UNIGRAM_WEIGHT, total / (total + UNIGRAM_TRUST_SCALE)) else 0.0
+
+        return PredictionContext(
+            curated = curated,
+            userRow = row,
+            userRowTotal = rowTotal,
+            beta = beta,
+            lambda = if (hasEvidence) BIGRAM_WEIGHT else 0.0,
+            alpha = alpha,
+            userTotal = total
+        )
+    }
+
+    private fun probability(word: String, ctx: PredictionContext): Double {
+        val r = rank[word]
+        val zipf = if (r == null) 0.0 else 1.0 / ((r + 1) * harmonic)
+        val userFreq = if (ctx.userTotal > 0.0) user.unigramCount(word) / ctx.userTotal else 0.0
+        val uni = (1.0 - ctx.alpha) * zipf + ctx.alpha * userFreq
+
+        var bi = 0.0
+        if (ctx.lambda > 0.0) {
+            val cur = ctx.curated[word] ?: 0.0
+            val usr = if (ctx.userRow != null && ctx.userRowTotal > 0.0) {
+                (ctx.userRow[word] ?: 0f) / ctx.userRowTotal
+            } else {
+                0.0
+            }
+            bi = (1.0 - ctx.beta) * cur + ctx.beta * usr
+        }
+        return ctx.lambda * bi + (1.0 - ctx.lambda) * uni + FLOOR
+    }
+
+    /** Overall frequency of a word (blended with the person's own usage). */
+    fun frequencyOf(word: String): Double = probability(normalize(word), contextFor(""))
+
+    /**
+     * How plausible each word is after [previous], scaled to 0..1 on a log
+     * curve. Used by the autocorrector to break ties toward likelier words.
+     */
+    fun priorScorer(previous: String): (String) -> Double {
+        val ctx = contextFor(previous)
+        return { word ->
+            ((ln(probability(word, ctx)) - LN_FLOOR) / (LN_CEIL - LN_FLOOR)).coerceIn(0.0, 1.0)
+        }
+    }
+
+    // ---------- prediction ----------
+
+    /** Most likely whole word that continues [prefix], or null if none does. */
+    fun predictNextWord(previousWord: String, prefix: String): String? {
+        val p = normalize(prefix)
+        val ctx = contextFor(previousWord)
         var best: String? = null
         var bestScore = -1.0
-        for (word in WORDS) {
-            if (word.length <= lowerPrefix.length || !word.startsWith(lowerPrefix)) continue
-            val bigramBoost = continuations[word] ?: 0.0
-            val score = frequencyOf(word) + bigramBoost * 2.0
-            if (score > bestScore) {
-                bestScore = score
-                best = word
+        for (w in vocabulary()) {
+            if (w.length <= p.length || !w.startsWith(p)) continue
+            val s = probability(w, ctx)
+            if (s > bestScore) {
+                bestScore = s
+                best = w
             }
         }
         return best
     }
 
-    fun predictNextChar(previousWord: String, prefix: String): Char? {
-        val word = predictNextWord(previousWord, prefix) ?: return null
-        return word.getOrNull(prefix.length)
+    /**
+     * The [count] most likely words that start with [prefix] (including the
+     * prefix itself if it is a word), best first.
+     */
+    fun suggestions(previousWord: String, prefix: String, count: Int): List<String> {
+        val p = normalize(prefix)
+        val ctx = contextFor(previousWord)
+        val scored = ArrayList<Pair<String, Double>>()
+        for (w in vocabulary()) {
+            if (w.startsWith(p)) scored.add(w to probability(w, ctx))
+        }
+        scored.sortByDescending { it.second }
+        return scored.take(count).map { it.first }
     }
+
+    /**
+     * Most likely next character, judged by adding up the probability of
+     * every word that could follow [prefix] (not just the single best
+     * word), so "wh" leans toward 'a' because what/wha... outweigh the
+     * rest. Returns ' ' if the word is most likely already finished, and
+     * null when nothing is likely enough to be worth highlighting.
+     */
+    fun predictNextChar(previousWord: String, prefix: String): Char? {
+        val p = normalize(prefix)
+        val ctx = contextFor(previousWord)
+        val mass = HashMap<Char, Double>()
+        var total = 0.0
+        for (w in vocabulary()) {
+            if (!w.startsWith(p)) continue
+            val pr = probability(w, ctx)
+            total += pr
+            val c = if (w.length == p.length) ' ' else w[p.length]
+            mass[c] = (mass[c] ?: 0.0) + pr
+        }
+        if (total <= 0.0) return null
+
+        var bestChar: Char? = null
+        var bestMass = 0.0
+        for ((c, m) in mass) {
+            if (m > bestMass) {
+                bestMass = m
+                bestChar = c
+            }
+        }
+        if (bestChar == null || bestMass / total < MIN_CONFIDENCE) return null
+        return bestChar
+    }
+
+    // ---------- learning ----------
+
+    /**
+     * Record that [word] was typed after [previous]. Pass [START] (or "" if
+     * the context is unknown) for the previous word as appropriate.
+     */
+    fun learn(previous: String, word: String, weight: Float = 1f) {
+        val w = normalize(word)
+        if (!isLearnable(w)) return
+        if (w.length == 1 && w != "a" && w != "i") return
+        user.learn(contextWord(previous), w, weight)
+    }
+
+    fun unlearn(previous: String, word: String, weight: Float = 1f) {
+        val w = normalize(word)
+        if (!isLearnable(w)) return
+        user.unlearn(contextWord(previous), w, weight)
+    }
+
+    private fun contextWord(previous: String): String {
+        val p = normalize(previous)
+        return if (p == START || isLearnable(p)) p else ""
+    }
+
+    /** Write anything not yet saved; call when the keyboard is dismissed. */
+    fun flush() = user.flush()
+
+    /** Forget everything learned from the person's typing. */
+    fun clearLearned(context: Context) = user.clear(context.applicationContext)
+
 }
