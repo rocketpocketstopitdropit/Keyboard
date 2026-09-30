@@ -2,6 +2,9 @@ package com.example.customkeyboard
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Color
 import android.os.Bundle
 import android.text.InputType
@@ -90,11 +93,67 @@ class KeyEditorActivity : Activity() {
                 KeyboardPrefs.setLearnWords(this, it)
             }
         )
+        controls.addView(
+            toggleRow("Capitalize new sentences", KeyboardPrefs.getAutoCapitalize(this)) {
+                KeyboardPrefs.setAutoCapitalize(this, it)
+            }
+        )
+        controls.addView(
+            toggleRow("Double-tap space for a period", KeyboardPrefs.getDoubleSpacePeriod(this)) {
+                KeyboardPrefs.setDoubleSpacePeriod(this, it)
+            }
+        )
         controls.addView(Button(this).apply {
             text = "Clear learned words"
             setOnClickListener {
                 WordPredictor.clearLearned(this@KeyEditorActivity)
                 Toast.makeText(this@KeyEditorActivity, "Learned words cleared", Toast.LENGTH_SHORT).show()
+            }
+        })
+        controls.addView(TextView(this).apply {
+            text = "Backup"
+            textSize = 14f
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        controls.addView(Button(this).apply {
+            text = "Copy settings backup"
+            setOnClickListener {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText("Keyboard settings", SettingsBackup.export(this@KeyEditorActivity))
+                )
+                Toast.makeText(
+                    this@KeyEditorActivity,
+                    "Copied. Paste it into a note to keep it safe.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        })
+        controls.addView(Button(this).apply {
+            text = "Restore settings from clipboard"
+            setOnClickListener {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = clipboard.primaryClip
+                val text = if (clip != null && clip.itemCount > 0) {
+                    clip.getItemAt(0).coerceToText(this@KeyEditorActivity)?.toString()
+                } else {
+                    null
+                }
+                if (text.isNullOrBlank()) {
+                    Toast.makeText(this@KeyEditorActivity, "Nothing on the clipboard.", Toast.LENGTH_SHORT).show()
+                } else {
+                    try {
+                        val count = SettingsBackup.restore(this@KeyEditorActivity, text)
+                        Toast.makeText(this@KeyEditorActivity, "Restored $count settings.", Toast.LENGTH_SHORT).show()
+                        recreate()
+                    } catch (e: Exception) {
+                        Toast.makeText(
+                            this@KeyEditorActivity,
+                            "That isn't a keyboard settings backup.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
             }
         })
         controls.addView(TextView(this).apply {
