@@ -1,3 +1,4 @@
+// >>>>>>>> PART 1 OF 2 (about 13,792 characters): START COPYING ON THE NEXT LINE (start a fresh, empty file) >>>>>>>>
 package com.example.customkeyboard
 
 import android.content.Context
@@ -260,6 +261,8 @@ object WordPredictor {
 
     fun normalize(word: String): String = word.lowercase().replace('\u2019', '\'')
 
+// <<<<<<<< END OF PART 1 OF 2: STOP COPYING ON THE PREVIOUS LINE <<<<<<<<
+// >>>>>>>> PART 2 OF 2 (about 10,938 characters): START COPYING ON THE NEXT LINE (paste straight below part 1) >>>>>>>>
     /** Only plain words (letters, with an inner apostrophe) are worth keeping. */
     private fun isLearnable(w: String): Boolean {
         if (w.isEmpty() || w.length > MAX_WORD_LEN) return false
@@ -421,4 +424,129 @@ object WordPredictor {
         return ctx.lambda * bi + (1.0 - ctx.lambda) * uni + FLOOR
     }
 
-    /** Overall frequenc
+    /** Overall frequency of a word (blended with the person's own usage). */
+    fun frequencyOf(word: String): Double = probability(normalize(word), contextFor(""))
+
+    /**
+     * How plausible each word is after [previous], scaled to 0..1 on a log
+     * curve. Used by the autocorrector to break ties toward likelier words.
+     */
+    fun priorScorer(previous: String): (String) -> Double {
+        val ctx = contextFor(previous)
+        return { word ->
+            ((ln(probability(word, ctx)) - LN_FLOOR) / (LN_CEIL - LN_FLOOR)).coerceIn(0.0, 1.0)
+        }
+    }
+
+    // ---------- prediction ----------
+
+    /**
+     * The [count] most likely words that start with [prefix] (including the
+     * prefix itself if it is a word), best first.
+     */
+    fun suggestions(previousWord: String, prefix: String, count: Int): List<String> {
+        val p = normalize(prefix)
+        val idx = vocabIndex()
+        val ctx = contextFor(previousWord)
+        val scored = ArrayList<Pair<String, Double>>()
+        var i = firstWithPrefix(idx, p)
+        while (i < idx.sorted.size && idx.sorted[i].startsWith(p)) {
+            val w = idx.sorted[i]
+            scored.add(w to probability(w, ctx))
+            i++
+        }
+        scored.sortByDescending { it.second }
+        return scored.take(count).map { it.first }
+    }
+
+    private var firstLetterPrev: String? = null
+    private var firstLetterData = -1
+    private var firstLetterVocab = -1
+    private var firstLetterCache: Map<Char, Double> = emptyMap()
+
+    /**
+     * How likely each next letter (a-z) is after [prefix], judged by adding up
+     * the probability of every real word that could follow it, so "wh" leans
+     * toward 'a' because what/wha... outweigh the rest. The shares add up to 1.
+     * Empty when no word continues the prefix.
+     */
+    fun letterDistribution(previousWord: String, prefix: String): Map<Char, Double> {
+        val p = normalize(prefix)
+        val prev = normalize(previousWord)
+        if (p.isEmpty() && firstLetterPrev == prev &&
+            firstLetterData == user.dataVersion && firstLetterVocab == user.vocabularyVersion
+        ) {
+            return firstLetterCache
+        }
+        val idx = vocabIndex()
+        val ctx = contextFor(previousWord)
+        val mass = HashMap<Char, Double>()
+        var total = 0.0
+        var i = if (p.isEmpty()) 0 else firstWithPrefix(idx, p)
+        while (i < idx.sorted.size) {
+            val w = idx.sorted[i]
+            if (!w.startsWith(p)) break
+            i++
+            if (w.length == p.length) continue
+            val c = w[p.length]
+            if (c < 'a' || c > 'z') continue
+            val pr = probability(w, ctx)
+            total += pr
+            mass[c] = (mass[c] ?: 0.0) + pr
+        }
+        val result: Map<Char, Double> = if (total <= 0.0) emptyMap() else mass.mapValues { it.value / total }
+        if (p.isEmpty()) {
+            firstLetterPrev = prev
+            firstLetterData = user.dataVersion
+            firstLetterVocab = user.vocabularyVersion
+            firstLetterCache = result
+        }
+        return result
+    }
+
+    /** The single likeliest next letter, or null when nothing is likely enough to be worth showing. */
+    fun predictNextChar(previousWord: String, prefix: String): Char? {
+        var bestChar: Char? = null
+        var bestMass = 0.0
+        for ((c, m) in letterDistribution(previousWord, prefix)) {
+            if (m > bestMass) {
+                bestMass = m
+                bestChar = c
+            }
+        }
+        if (bestChar == null || bestMass < MIN_CONFIDENCE) return null
+        return bestChar
+    }
+
+    // ---------- learning ----------
+
+    /**
+     * Record that [word] was typed after [previous]. Pass [START] (or "" if
+     * the context is unknown) for the previous word as appropriate. Words
+     * that aren't real words are ignored.
+     */
+    fun learn(previous: String, word: String, weight: Float = 1f) {
+        val w = normalize(word)
+        if (!isLearnable(w) || !isKnown(w)) return
+        user.learn(contextWord(previous), w, weight)
+    }
+
+    fun unlearn(previous: String, word: String, weight: Float = 1f) {
+        val w = normalize(word)
+        if (!isLearnable(w) || !isKnown(w)) return
+        user.unlearn(contextWord(previous), w, weight)
+    }
+
+    private fun contextWord(previous: String): String {
+        val p = normalize(previous)
+        return if (p == START || isKnown(p)) p else ""
+    }
+
+    /** Housekeeping and saving; the keyboard calls this during a pause in typing. */
+    fun flush() = user.flush()
+
+    /** Forget everything learned from the person's typing (added words are kept). */
+    fun clearLearned(context: Context) = user.clear(context.applicationContext)
+
+}
+// <<<<<<<< END OF PART 2 OF 2: STOP COPYING ON THE PREVIOUS LINE - THAT IS THE WHOLE FILE <<<<<<<<
