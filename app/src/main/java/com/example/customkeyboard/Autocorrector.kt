@@ -127,15 +127,17 @@ object Autocorrector {
 
         var best: String? = null
         var bestScore = Double.MAX_VALUE
-        for (candidate in WordPredictor.vocabulary()) {
-            // Each insert/delete costs 1.0, so a length gap of 2 can never fit under the limit.
-            if (abs(candidate.length - lower.length) > 1) continue
-            val d = typoDistance(lower, candidate, limit, ws)
-            if (d > limit) continue
-            val score = d - PRIOR_WEIGHT * prior(candidate)
-            if (score < bestScore) {
-                bestScore = score
-                best = candidate
+        // Each insert/delete costs 1.0, so a length gap of 2 can never fit under the
+        // limit: only words one letter shorter, the same length, or one longer are tried.
+        for (length in (lower.length - 1)..(lower.length + 1)) {
+            for (candidate in WordPredictor.wordsOfLength(length)) {
+                val d = typoDistance(lower, candidate, limit, ws)
+                if (d > limit) continue
+                val score = d - PRIOR_WEIGHT * prior(candidate)
+                if (score < bestScore) {
+                    bestScore = score
+                    best = candidate
+                }
             }
         }
         return if (best != null && best != lower) best else null
