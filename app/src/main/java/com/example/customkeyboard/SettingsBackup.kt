@@ -13,7 +13,7 @@ import org.json.JSONObject
 object SettingsBackup {
 
     private const val MARKER = "customkeyboard-settings"
-    private val STORES = listOf("keyboard_settings", "keyboard_layout_overrides")
+    private val STORES = listOf("keyboard_settings", "keyboard_layout_overrides", "user_dictionary")
     private val SKIPPED_KEYS = setOf("klipy_api_key")
 
     private fun encode(value: Any?): JSONObject? {
