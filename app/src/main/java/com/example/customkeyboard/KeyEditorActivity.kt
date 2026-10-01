@@ -30,6 +30,7 @@ class KeyEditorActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        WordPredictor.init(this)
 
         val matchParent = ViewGroup.LayoutParams.MATCH_PARENT
         val wrapContent = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -94,6 +95,17 @@ class KeyEditorActivity : Activity() {
             }
         )
         controls.addView(
+            sliderRow("Prediction strength", 0, 100, KeyboardPrefs.getPredictionStrength(this), "%") {
+                KeyboardPrefs.setPredictionStrength(this, it)
+            }
+        )
+        controls.addView(TextView(this).apply {
+            text = "How much the keyboard widens the key it expects next. Higher helps when the guess is right; " +
+                    "0 turns it off. Where your finger lands always counts most."
+            textSize = 12f
+            alpha = 0.7f
+        })
+        controls.addView(
             toggleRow("Capitalize new sentences", KeyboardPrefs.getAutoCapitalize(this)) {
                 KeyboardPrefs.setAutoCapitalize(this, it)
             }
@@ -103,6 +115,64 @@ class KeyEditorActivity : Activity() {
                 KeyboardPrefs.setDoubleSpacePeriod(this, it)
             }
         )
+        val wordsList = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(8))
+        }
+        fun refreshWordsList() {
+            val list = WordPredictor.addedWords()
+            wordsList.text = if (list.isEmpty()) "No added words yet." else list.joinToString(", ")
+        }
+        val wordInput = EditText(this).apply {
+            hint = "Type a word to add or remove"
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        controls.addView(TextView(this).apply {
+            text = "My words (only real words are ever suggested; add your own here)"
+            textSize = 14f
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        controls.addView(wordInput)
+        val wordButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        wordButtons.addView(Button(this).apply {
+            text = "Add"
+            setOnClickListener {
+                val w = wordInput.text.toString().trim()
+                val message = when {
+                    w.isEmpty() -> "Type a word first."
+                    WordPredictor.addWord(w) -> "Added to your words."
+                    else -> "Already a known word, or not a plain word."
+                }
+                Toast.makeText(this@KeyEditorActivity, message, Toast.LENGTH_SHORT).show()
+                wordInput.setText("")
+                refreshWordsList()
+            }
+        }, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        wordButtons.addView(Button(this).apply {
+            text = "Remove"
+            setOnClickListener {
+                val w = wordInput.text.toString().trim()
+                val message = when {
+                    w.isEmpty() -> "Type a word first."
+                    WordPredictor.removeWord(w) -> "Removed."
+                    else -> "That isn't one of your added words."
+                }
+                Toast.makeText(this@KeyEditorActivity, message, Toast.LENGTH_SHORT).show()
+                wordInput.setText("")
+                refreshWordsList()
+            }
+        }, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        wordButtons.addView(Button(this).apply {
+            text = "Clear all"
+            setOnClickListener {
+                WordPredictor.clearAddedWords()
+                refreshWordsList()
+            }
+        }, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        controls.addView(wordButtons)
+        controls.addView(wordsList)
+        refreshWordsList()
         controls.addView(Button(this).apply {
             text = "Clear learned words"
             setOnClickListener {
@@ -144,6 +214,7 @@ class KeyEditorActivity : Activity() {
                 } else {
                     try {
                         val count = SettingsBackup.restore(this@KeyEditorActivity, text)
+                        WordPredictor.reloadUserWords()
                         Toast.makeText(this@KeyEditorActivity, "Restored $count settings.", Toast.LENGTH_SHORT).show()
                         recreate()
                     } catch (e: Exception) {
@@ -344,3 +415,4 @@ class KeyEditorActivity : Activity() {
             TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
         ).toInt()
 }
+
