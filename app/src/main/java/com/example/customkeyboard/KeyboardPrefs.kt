@@ -12,6 +12,7 @@ object KeyboardPrefs {
     private const val SHOW_PREDICTED_HIGHLIGHT = "show_predicted_highlight"
     private const val SHOW_NUMBER_ROW = "show_number_row"
     private const val LEARN_WORDS = "learn_words"
+    private const val PREDICTION_STRENGTH = "prediction_strength"
     private const val AUTO_CAPITALIZE = "auto_capitalize"
     private const val DOUBLE_SPACE_PERIOD = "double_space_period"
     private const val KLIPY_KEY = "klipy_api_key"
@@ -63,6 +64,12 @@ object KeyboardPrefs {
     fun setLearnWords(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(LEARN_WORDS, value).apply()
 
+    // How strongly the keyboard's guess about the next letter widens that key's touch area (0-100).
+    fun getPredictionStrength(context: Context): Int =
+        prefs(context).getInt(PREDICTION_STRENGTH, 50)
+    fun setPredictionStrength(context: Context, value: Int) =
+        prefs(context).edit().putInt(PREDICTION_STRENGTH, value).apply()
+
     // Capitalize the first letter of each new sentence.
     fun getAutoCapitalize(context: Context): Boolean =
         prefs(context).getBoolean(AUTO_CAPITALIZE, true)
@@ -81,3 +88,4 @@ object KeyboardPrefs {
     fun setKlipyKey(context: Context, value: String) =
         prefs(context).edit().putString(KLIPY_KEY, value).apply()
 }
+
