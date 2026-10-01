@@ -380,7 +380,7 @@ class MyKeyboardIME : InputMethodService() {
             }
         }
     }
-/ >>>>>>>> PART 2 OF 4 (about 14,570 characters): START COPYING ON THE NEXT LINE (paste straight below part 1) >>>>>>>>
+// >>>>>>>> PART 2 OF 4 (about 14,570 characters): START COPYING ON THE NEXT LINE (paste straight below part 1) >>>>>>>>
     /** In GIF mode the letter keys type into the search box, not into the app. */
     private fun handleGifKey(config: KeyConfig): Boolean {
         return when (config.action) {
