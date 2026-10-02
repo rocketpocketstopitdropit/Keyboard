@@ -1,7 +1,7 @@
 sentences 2037234, words 15728504
-pairs kept 150000 in 18614 contexts
-triples kept 150000 in 53482 contexts
-left out as overused (83): tom, mary, sami, yanni, boston, rima, tom's, layla, algeria, berber, mary's, should've, algiers, algerian, algeria's, esperanto, flavio, leonid, rodrigo, sleepy, damiano, dmitri, lukas, santiago, kalman, oleg, gustavo, elias, fyodor, lorenzo, alberto, tobias, martino, igor, janos, yuri, miroslav, claudio, gunter, gabor, isabella, adriano, algerians, must've, walid, windshield, pietro, mina, coronavirus, giraffes, farid, hijab, what'll, couscous, hurried, lajos, fluently, caf, suitcases, toki, anna's, melissa's, homesick, hyena, linda's, amelia's, what're, ewe, heathers, isabella's, berbers, mustn't, punctual, amanda's, jessica's, matthew's, sandra's, ticklish, tagalog, centipede, shahada, sociopaths, yazid
+pairs kept 150000 in 18600 contexts
+triples kept 150000 in 53514 contexts
+left out as overused (70): tom, mary, sami, yanni, boston, rima, tom's, layla, algeria, berber, mary's, algiers, algerian, algeria's, esperanto, flavio, leonid, rodrigo, sleepy, damiano, dmitri, lukas, santiago, kalman, oleg, gustavo, elias, fyodor, lorenzo, alberto, tobias, martino, igor, janos, yuri, miroslav, claudio, gunter, gabor, isabella, adriano, algerians, walid, windshield, pietro, mina, coronavirus, giraffes, farid, hijab, couscous, hurried, lajos, fluently, caf, suitcases, toki, homesick, hyena, ewe, heathers, isabella's, berbers, punctual, ticklish, tagalog, centipede, shahada, sociopaths, yazid
 after '<s>': i 301817, the 102535, he 87928, she 49484, you 49408, i'm 46918, we 45907, they 36693
 after 'and': i 7828, the 5446, a 2733, his 1647, he 1574, then 1297, it 874, you 844
 after 'i': don't 39689, think 20878, know 19686, was 17984, have 17553, didn't 17365, want 11773, thought 10472
