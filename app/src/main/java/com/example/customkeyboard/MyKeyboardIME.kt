@@ -380,7 +380,6 @@ class MyKeyboardIME : InputMethodService() {
             }
         }
     }
-// >>>>>>>> PART 2 OF 4 (about 14,570 characters): START COPYING ON THE NEXT LINE (paste straight below part 1) >>>>>>>>
     /** In GIF mode the letter keys type into the search box, not into the app. */
     private fun handleGifKey(config: KeyConfig): Boolean {
         return when (config.action) {
@@ -755,9 +754,7 @@ class MyKeyboardIME : InputMethodService() {
         uiHandler.post(r)
     }
 
-// <<<<<<<< END OF PART 2 OF 4: STOP COPYING ON THE PREVIOUS LINE <<<<<<<<
-//
-private fun moveCursor(dir: Int) {
+    private fun moveCursor(dir: Int) {
         val ic = currentInputConnection ?: return
         val keyCode = if (dir > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
@@ -1098,9 +1095,7 @@ private fun moveCursor(dir: Int) {
         autoPeriodAllowed = plainText && KeyboardPrefs.getDoubleSpacePeriod(this)
     }
 
-// <<<<<<<< END OF PART 3 OF 4: STOP COPYING ON THE PREVIOUS LINE <<<<<<<<
-// >>>>>>>> PART 4 OF 4 (about 9,636
-private fun textBeforeIsWordThenSpace(ic: InputConnection): Boolean {
+    private fun textBeforeIsWordThenSpace(ic: InputConnection): Boolean {
         val before = ic.getTextBeforeCursor(2, 0)
         if (before == null || before.length < 2) return spaceAfterWord
         val prior = before[0]
@@ -1351,4 +1346,3 @@ private fun textBeforeIsWordThenSpace(ic: InputConnection): Boolean {
             TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
         ).toInt()
 }
-// <<<<<<<< END OF PART 4 OF 4: STOP COPYING ON THE PREVIOUS LINE - THAT IS THE WHOLE FILE <<<<<<<<
