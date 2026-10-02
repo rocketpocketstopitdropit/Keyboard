@@ -1,13 +1,20 @@
 sentences 2037234, words 15728504
-pairs kept 150000 in 18310 contexts
-triples kept 150000 in 53783 contexts
-after '<s>': i 301817, the 102535, he 87928, she 49484, you 49408, sami 48739, i'm 46918, we 45907
-after 'and': i 7828, the 5446, rima 3004, a 2733, layla 2726, his 1647, he 1574, then 1297
+pairs kept 150000 in 18614 contexts
+triples kept 150000 in 53482 contexts
+left out as overused (83): tom, mary, sami, yanni, boston, rima, tom's, layla, algeria, berber, mary's, should've, algiers, algerian, algeria's, esperanto, flavio, leonid, rodrigo, sleepy, damiano, dmitri, lukas, santiago, kalman, oleg, gustavo, elias, fyodor, lorenzo, alberto, tobias, martino, igor, janos, yuri, miroslav, claudio, gunter, gabor, isabella, adriano, algerians, must've, walid, windshield, pietro, mina, coronavirus, giraffes, farid, hijab, what'll, couscous, hurried, lajos, fluently, caf, suitcases, toki, anna's, melissa's, homesick, hyena, linda's, amelia's, what're, ewe, heathers, isabella's, berbers, mustn't, punctual, amanda's, jessica's, matthew's, sandra's, ticklish, tagalog, centipede, shahada, sociopaths, yazid
+after '<s>': i 301817, the 102535, he 87928, she 49484, you 49408, i'm 46918, we 45907, they 36693
+after 'and': i 7828, the 5446, a 2733, his 1647, he 1574, then 1297, it 874, you 844
 after 'i': don't 39689, think 20878, know 19686, was 17984, have 17553, didn't 17365, want 11773, thought 10472
 after 'a': lot 14814, good 9179, little 7039, very 5593, new 5181, few 4882, long 3893, bit 3044
 after 'the': same 7731, only 6367, first 5740, one 5686, world 5536, door 5149, way 4382, last 4332
 after 'to': do 73613, be 35396, the 30030, go 18389, get 12654, help 9537, see 8176, me 7773
+after 'in': the 53099, a 14268, his 6848, australia 5857, this 4787, my 4620, your 2523, her 2465
+after 'with': the 7201, a 6912, you 4990, his 4717, him 4162, her 4103, me 3744, us 3396
+after 'my': father 2388, life 1774, mother 1770, parents 1419, house 1258, brother 1221, car 1092, friend 1076
 after '<s> i': don't 35209, think 19291, know 17435, didn't 14380, have 12314, was 10224, thought 9463, want 9377
 after 'i want': to 7711, you 1343, a 484, my 114, him 102, is 99, the 91, this 71
-after 'going to': be 5062, do 3281, the 1132, have 1112, happen 1047, get 1027, go 992, boston 691
+after 'going to': be 5062, do 3281, the 1132, have 1112, happen 1047, get 1027, go 992, take 611
 after 'how are': you 448, we 118, things 55, your 26, they 24, the 19, these 3, my 2
+after 'i love': you 636, the 261, to 147, my 136, her 128, him 125, this 115, that 72
+after 'what are': you 1484, the 318, your 214, we 161, some 130, they 101, these 31, those 24
+after 'see you': again 226, in 149, at 98, tomorrow 89, next 63, here 61, later 48, on 33
