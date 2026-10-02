@@ -2,6 +2,7 @@ package com.example.customkeyboard
 
 import android.content.Context
 import kotlin.math.ln
+import kotlin.math.log10
 import kotlin.math.pow
 
 /**
@@ -65,6 +66,9 @@ object WordPredictor {
     private const val CURATED_SHARE = 0.3
     private const val MAX_CONTEXT_WEIGHT = 0.9
     private const val FLOOR = 1e-7
+
+    /** Big-list words at least this common (Zipf) are never autocorrected. */
+    private const val TRUSTED_ZIPF = 3.5
 
     /** Words the person added have no frequency rank, so they get a fair mid-list one. */
     private const val ADDED_WORD_RANK = 1500
@@ -241,6 +245,21 @@ object WordPredictor {
     /** Prior for a word the person added, when real frequencies are in use. */
     private var addedWordFreq = 0.0
 
+    /**
+     * Zipf values of the rare words in wordlist.txt. The big list is drawn
+     * from real web text, so its rare end includes common slips ("rhe",
+     * "abd", "yoy", "bew") alongside genuinely rare words. Words here are
+     * still real, but the autocorrector may fix them toward a far more
+     * common word one slip away.
+     */
+    private var rareZipf: Map<String, Float> = emptyMap()
+
+    /** Words from the hand-made lists (built-in WORDS, wordlist2-4): always trusted as typed. */
+    private var curatedWords: Set<String> = WORDS.toHashSet()
+
+    /** Undoes the normalisation of [staticFreq], so a stored share converts back to Zipf. */
+    private var freqScale = 1.0
+
     /** Word pairs and triples counted from real conversations. */
     private class NgramTables(
         val pairs: Map<String, Map<String, Float>>,
@@ -361,6 +380,15 @@ object WordPredictor {
             for (w in extras) if (!freq.containsKey(w)) freq[w] = rarest
             val sum = freq.values.sum()
             for (e in freq.entries) e.setValue(e.value / sum)
+            freqScale = sum
+            val handListed = HashSet<String>(WORDS).also { it.addAll(extras) }
+            val rare = HashMap<String, Float>()
+            for ((w, f) in listed) {
+                if (f == null || w in handListed) continue
+                val z = log10(f) + 9.0
+                if (z < TRUSTED_ZIPF) rare[w] = z.toFloat()
+            }
+            rareZipf = rare
             staticWords = freq.keys.toList()
             staticFreq = freq
             // Added words get the frequency of a fairly common word, like their old mid-list rank.
@@ -368,6 +396,7 @@ object WordPredictor {
         }
         rank = buildRank(staticWords)
         harmonic = harmonicSum(staticWords.size)
+        curatedWords = HashSet<String>(WORDS).also { it.addAll(extras) }
     }
 
     // ---------- text hygiene ----------
@@ -457,6 +486,27 @@ object WordPredictor {
         return i < idx.sorted.size && idx.sorted[i].startsWith(p)
     }
 
+    /**
+     * The Zipf value of [word] if it is a real but rare word from the big list
+     * that the autocorrector may still fix (null when it should always be kept
+     * as typed: common words, hand-listed words, the person's own words).
+     */
+    fun rareZipfOf(word: String): Double? {
+        val w = normalize(word)
+        if (user.isAdded(w) || w in curatedWords) return null
+        return rareZipf[w]?.toDouble()
+    }
+
+    /** A word that is always kept exactly as typed. */
+    fun isTrusted(word: String): Boolean = isKnown(word) && rareZipfOf(word) == null
+
+    /** General Zipf value of a dictionary word (log10 of uses per billion words), or null. */
+    fun zipfOf(word: String): Double? {
+        val f = staticFreq?.get(normalize(word)) ?: return null
+        if (f <= 0.0) return null
+        return log10(f * freqScale) + 9.0
+    }
+
     /** A real word: in the built-in dictionary, or one the person added. */
     fun isKnown(word: String): Boolean {
         val w = normalize(word)
@@ -468,7 +518,7 @@ object WordPredictor {
     /** Adds a word to the person's dictionary. False if it isn't a plain word or is already known. */
     fun addWord(word: String): Boolean {
         val w = normalize(word.trim())
-        if (!isLearnable(w) || isKnown(w)) return false
+        if (!isLearnable(w) || isTrusted(w)) return false
         return user.addWord(w)
     }
 

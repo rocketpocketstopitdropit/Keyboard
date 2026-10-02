@@ -25,6 +25,13 @@ object Autocorrector {
     private const val TRANSPOSE_COST = 0.6
     private const val PRIOR_WEIGHT = 0.6
 
+    /** A rare word is only fixed toward a word at least this much more common (Zipf, ~300x). */
+    private const val RARE_GAP = 2.5
+    /** ...and the fix must itself be an everyday word. */
+    private const val RARE_MIN_TARGET = 4.0
+    /** Below this, two neighbour slips are allowed too. */
+    private const val VERY_RARE_ZIPF = 2.5
+
     /** Longest edit distance that still counts as "clearly a typo". */
     private const val MAX_DISTANCE = 1.2
 
@@ -100,6 +107,51 @@ object Autocorrector {
         return prev1[m]
     }
 
+    /** True if [b] is [a] with one pair of neighbouring letters swapped ("teh" / "the"). */
+    private fun isSwap(a: String, b: String): Boolean {
+        if (a.length != b.length) return false
+        var first = -1
+        var count = 0
+        for (i in a.indices) {
+            if (a[i] != b[i]) {
+                if (count == 0) first = i
+                count++
+                if (count > 2) return false
+            }
+        }
+        return count == 2 && first + 1 < a.length && a[first] != b[first] && a[first + 1] != b[first + 1] &&
+                a[first] == b[first + 1] && a[first + 1] == b[first]
+    }
+
+    /**
+     * A real-but-rare word ([zipf] = how common it is) is replaced only by a
+     * word of the same length that is hundreds of times more common and
+     * reached by a single slip onto a neighbouring key or a swapped pair. The
+     * very rarest also allow two neighbour slips ("abf" -> "and").
+     */
+    private fun rareWordCorrection(lower: String, zipf: Double, previousWord: String): String? {
+        if (lower.length < 3) return null
+        val minZipf = maxOf(zipf + RARE_GAP, RARE_MIN_TARGET)
+        val prior = WordPredictor.priorScorer(previousWord)
+        val ws = Workspace(lower.length + 3)
+        var best: String? = null
+        var bestScore = Double.MAX_VALUE
+        for (candidate in WordPredictor.wordsOfLength(lower.length)) {
+            val cz = WordPredictor.zipfOf(candidate) ?: continue
+            if (cz < minZipf) continue
+            val d = typoDistance(lower, candidate, TRANSPOSE_COST + 0.05, ws)
+            val ok = d <= NEIGHBOUR_COST + 0.05 ||
+                    (d <= TRANSPOSE_COST + 0.05 && (zipf < VERY_RARE_ZIPF || isSwap(lower, candidate)))
+            if (!ok) continue
+            val score = d - PRIOR_WEIGHT * prior(candidate)
+            if (score < bestScore) {
+                bestScore = score
+                best = candidate
+            }
+        }
+        return best
+    }
+
     /**
      * The correction for [typedWord] (typed after [previousWord]), or null
      * to leave it alone.
@@ -114,7 +166,13 @@ object Autocorrector {
         // "i'm" -> "I'm" (checked before the known-word test, since "i'm" is a known word)
         if (typedWord[0] == 'i' && lower in I_CONTRACTIONS) return "I" + typedWord.substring(1)
 
-        if (WordPredictor.isKnown(lower)) return null
+        if (WordPredictor.isKnown(lower)) {
+            // Rare entries in the big word list include everyday slips ("rhe",
+            // "abd", "yoy"), so a rare word still gets fixed when a far more
+            // common word is one slip away.
+            val zipf = WordPredictor.rareZipfOf(lower) ?: return null
+            return rareWordCorrection(lower, zipf, previousWord)
+        }
 
         // Possessives and "'s" contractions ("john's") are almost never typos.
         if (lower.endsWith("'s")) return null

@@ -90,6 +90,8 @@ class MyKeyboardIME : InputMethodService() {
     private var lastCharWordish = false
     private var sentenceEndPending = false
     private var shiftIsAuto = false
+    /** The person switched off an automatic capital; don't force one on the next letter. */
+    private var autoCapCancelled = false
     private var autoCapAllowed = true
     private var autoPeriodAllowed = true
     private val doubleSpaceMs = 700L
@@ -963,6 +965,8 @@ class MyKeyboardIME : InputMethodService() {
                 autoShift()
             }
             KeyAction.SHIFT -> {
+                // Turning off a shift the keyboard turned on means "lowercase here".
+                if (shiftIsAuto && shiftState == ShiftState.ONCE) autoCapCancelled = true
                 shiftIsAuto = false
                 val now = SystemClock.uptimeMillis()
                 shiftState = when {
@@ -1043,9 +1047,21 @@ class MyKeyboardIME : InputMethodService() {
                 }
             }
             KeyAction.CHAR -> {
-                val text = config.commitOverride ?: outputFor(config)
+                var text = config.commitOverride ?: outputFor(config)
+                if (text.length == 1 && text[0].isLowerCase() && currentWord.isEmpty() &&
+                    config.commitOverride == null && autoCapAllowed && shiftState == ShiftState.OFF &&
+                    !autoCapCancelled && atSentenceStart(ic)
+                ) {
+                    text = text.uppercase()
+                }
+                val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic) else null
+                if (fixed != null) {
+                    currentWord.setLength(0)
+                    currentWord.append(fixed)
+                }
                 ic.commitText(text, 1)
                 val isLetter = text.length == 1 && text[0].isLetter()
+                if (isLetter) autoCapCancelled = false
                 // An apostrophe inside a word ("don't") belongs to the word.
                 val isInnerApostrophe = text.length == 1 && isApostrophe(text[0]) && currentWord.isNotEmpty()
                 if (isLetter || isInnerApostrophe) {
@@ -1077,18 +1093,62 @@ class MyKeyboardIME : InputMethodService() {
             }
             return
         }
-        currentInputConnection?.commitText(text, 1)
-        finishWord(currentWord.toString(), 1f)
+        val ic = currentInputConnection ?: return
+        pendingCorrection = null
+        val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic) else null
+        ic.commitText(text, 1)
+        finishWord(fixed ?: currentWord.toString(), 1f)
+        val endsSentence = text.length == 1 && (text[0] == '.' || text[0] == '!' || text[0] == '?')
+        if (endsSentence) previousWord = WordPredictor.START
         spaceAfterWord = false
         lastWasSpace = false
         lastCharWordish = false
-        sentenceEndPending = false
-        pendingCorrection = null
+        // "!" and "?" are flicks on the comma key, so they end sentences here too.
+        sentenceEndPending = endsSentence
         autocorrectSuppressedWord = null
         updatePrediction()
     }
 
     private fun isApostrophe(c: Char): Boolean = c == '\'' || c == '\u2019'
+
+    private fun isPunctuation(text: String): Boolean =
+        text.length == 1 && text[0] in ".,!?;:"
+
+    /**
+     * Autocorrect the word being typed when punctuation ends it (not just the
+     * space bar), so "rhe." becomes "the.". Returns the corrected word, or null
+     * if it was left alone. Backspace right after undoes it, like with space.
+     */
+    private fun correctBeforePunctuation(ic: InputConnection): String? {
+        val typed = currentWord.toString()
+        val suppressed = autocorrectSuppressedWord
+        autocorrectSuppressedWord = null
+        if (typed.isEmpty() || typed == suppressed || isApostrophe(typed.last()) || !autocorrectAllowed) return null
+        val correction = correctionFor(typed)?.let { matchCase(typed, it) } ?: return null
+        ic.deleteSurroundingText(typed.length, 0)
+        ic.commitText(correction, 1)
+        pendingCorrection = typed to correction
+        pendingCorrectionPrev = previousWord
+        return correction
+    }
+
+    /**
+     * Whether the cursor sits where a sentence starts: at the very beginning,
+     * after a new line, or after ". " / "! " / "? ". Checked right before the
+     * first letter of a word is typed, so capitals never depend on earlier
+     * state having been kept perfectly in step with the app.
+     */
+    private fun atSentenceStart(ic: InputConnection): Boolean {
+        val before = ic.getTextBeforeCursor(6, 0) ?: return false
+        var i = before.length - 1
+        if (i < 0) return true
+        if (before[i] == '\n') return true
+        if (before[i] != ' ') return false
+        while (i >= 0 && before[i] == ' ') i--
+        if (i < 0) return before.length < 6
+        val c = before[i]
+        return c == '.' || c == '!' || c == '?' || c == '\n'
+    }
 
     /**
      * The word just ended: learn it (after the previous word), add it to the
@@ -1190,7 +1250,7 @@ class MyKeyboardIME : InputMethodService() {
         }
         val best = words.getOrNull(0)
         val literal = if (typed.length >= 2 && !isApostrophe(typed.last()) &&
-            !WordPredictor.isKnown(typed)
+            (!WordPredictor.isKnown(typed) || correctionFor(typed) != null)
         ) "\"" + typed + "\"" else null
 
         val left: CharSequence?
@@ -1333,6 +1393,7 @@ class MyKeyboardIME : InputMethodService() {
         lastCharWordish = false
         sentenceEndPending = false
         corrTyped = null
+        autoCapCancelled = false
         predictionStrength = KeyboardPrefs.getPredictionStrength(this)
         selStart = info?.initialSelStart ?: 0
         selEnd = info?.initialSelEnd ?: 0
