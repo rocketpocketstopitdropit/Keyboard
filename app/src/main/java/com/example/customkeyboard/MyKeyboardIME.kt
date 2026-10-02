@@ -96,6 +96,13 @@ class MyKeyboardIME : InputMethodService() {
     private var autoPeriodAllowed = true
     private val doubleSpaceMs = 700L
 
+    // The space after the cursor was put there by the keyboard (an accepted
+    // suggestion or an autocorrection), so punctuation typed next goes right
+    // after the word instead of after that space.
+    private var autoSpaced = false
+    // That auto space now follows punctuation ("word, "), so a space tap is already done.
+    private var punctAttached = false
+
     // Where the selection is, kept up to date by the system so backspace never has to ask the app.
     private var selStart = 0
     private var selEnd = 0
@@ -536,7 +543,10 @@ class MyKeyboardIME : InputMethodService() {
             override fun onResults(results: Bundle?) {
                 val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
                     ?.replaceFirstChar { it.uppercase() }
-                if (!text.isNullOrBlank()) currentInputConnection?.commitText("$text ", 1)
+                if (!text.isNullOrBlank()) {
+                    currentInputConnection?.commitText("$text ", 1)
+                    clearAutoSpace()
+                }
                 stopListening()
             }
             override fun onError(error: Int) {
@@ -807,6 +817,7 @@ class MyKeyboardIME : InputMethodService() {
         currentWord.clear()
         previousWord = ""
         pendingCorrection = null
+        clearAutoSpace()
         spaceAfterWord = false
         lastWasSpace = false
         sentenceEndPending = false
@@ -913,6 +924,16 @@ class MyKeyboardIME : InputMethodService() {
     private fun handleTap(config: KeyConfig) {
         if (gifMode && handleGifKey(config)) return
         val ic = currentInputConnection ?: return
+
+        if (config.action == KeyAction.CHAR && config.commitOverride == null &&
+            attachPunctuation(ic, outputFor(config))
+        ) return
+        if (config.action == KeyAction.SPACE && swallowSpaceAfterPunctuation(ic)) return
+        when (config.action) {
+            // Shift and page switches (e.g. to the symbols page for ";") keep the auto space in play.
+            KeyAction.SHIFT, KeyAction.SYMBOLS, KeyAction.SYMBOLS_ALT, KeyAction.LETTERS -> {}
+            else -> clearAutoSpace()
+        }
 
         if (config.action == KeyAction.BACKSPACE) {
             spaceAfterWord = false
@@ -1032,6 +1053,7 @@ class MyKeyboardIME : InputMethodService() {
                     ic.commitText(" ", 1)
                     pendingCorrection = typed to correction
                     pendingCorrectionPrev = previousWord
+                    autoSpaced = true
                 } else {
                     ic.commitText(" ", 1)
                 }
@@ -1094,6 +1116,8 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
         val ic = currentInputConnection ?: return
+        if (attachPunctuation(ic, text)) return
+        clearAutoSpace()
         pendingCorrection = null
         val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic) else null
         ic.commitText(text, 1)
@@ -1107,6 +1131,55 @@ class MyKeyboardIME : InputMethodService() {
         sentenceEndPending = endsSentence
         autocorrectSuppressedWord = null
         updatePrediction()
+    }
+
+    private fun clearAutoSpace() {
+        autoSpaced = false
+        punctAttached = false
+    }
+
+    /**
+     * Right after an accepted suggestion or an autocorrection the text ends in
+     * "word ". Typing . ! ? , or ; then gives "word, " rather than "word ,":
+     * the punctuation goes straight after the word and the space moves after it.
+     */
+    private fun attachPunctuation(ic: InputConnection, text: String): Boolean {
+        if (!autoSpaced || currentWord.isNotEmpty() || text.length != 1 || text[0] !in ".!?,;") return false
+        if (selStart != selEnd || ic.getTextBeforeCursor(1, 0)?.toString() != " ") {
+            clearAutoSpace()
+            return false
+        }
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(1, 0)
+        ic.commitText("$text ", 1)
+        ic.endBatchEdit()
+        val endsSentence = text[0] == '.' || text[0] == '!' || text[0] == '?'
+        // Still an auto space, so "?!" chains the same way.
+        autoSpaced = true
+        punctAttached = true
+        pendingCorrection = null
+        autocorrectSuppressedWord = null
+        spaceAfterWord = false
+        lastWasSpace = false
+        lastCharWordish = false
+        sentenceEndPending = false
+        if (endsSentence) previousWord = WordPredictor.START
+        if (shiftState == ShiftState.ONCE) {
+            shiftState = ShiftState.OFF
+            shiftIsAuto = false
+            refreshLabels()
+        }
+        // The space is already there, so the next sentence's capital is due now.
+        if (endsSentence) autoShift()
+        updatePrediction()
+        return true
+    }
+
+    /** After "word, " the space is already typed, so a habitual space tap doesn't add a second one. */
+    private fun swallowSpaceAfterPunctuation(ic: InputConnection): Boolean {
+        if (!punctAttached || currentWord.isNotEmpty()) return false
+        clearAutoSpace()
+        return ic.getTextBeforeCursor(1, 0)?.toString() == " "
     }
 
     private fun isApostrophe(c: Char): Boolean = c == '\'' || c == '\u2019'
@@ -1307,6 +1380,8 @@ class MyKeyboardIME : InputMethodService() {
         corrTyped = null
         acceptWord = null
         finishWord(word, 1f)
+        autoSpaced = true
+        punctAttached = false
         // A space was committed with the word, so a quick second space can still make a period.
         spaceAfterWord = true
         lastWasSpace = true
@@ -1393,6 +1468,7 @@ class MyKeyboardIME : InputMethodService() {
         lastCharWordish = false
         sentenceEndPending = false
         corrTyped = null
+        clearAutoSpace()
         autoCapCancelled = false
         predictionStrength = KeyboardPrefs.getPredictionStrength(this)
         selStart = info?.initialSelStart ?: 0
