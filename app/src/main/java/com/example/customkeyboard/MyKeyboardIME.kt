@@ -588,7 +588,10 @@ class MyKeyboardIME : InputMethodService() {
     // ---------- Touch handling ----------
 
     /** What one finger is doing. Fingers are tracked separately so overlapping taps in fast typing all count. */
-    private class TouchState(val key: KeyView?, val downX: Float, val downY: Float) {
+    private class TouchState(val key: KeyView?, val downX: Float, val downY: Float, val seq: Long) {
+        /** Where the finger is now (for typing this key early, if a later finger lifts first). */
+        var lastX = downX
+        var lastY = downY
         /** Space bar only: -1 / +1 once it has become a cursor gesture. */
         var slideDir = 0
         var spaceGesture = false
@@ -605,6 +608,7 @@ class MyKeyboardIME : InputMethodService() {
     private var letterRects: List<LetterRect> = emptyList()
     private var repeatOwner = -1
     private var holdRunnable: Runnable? = null
+    private var touchSeq = 0L
 
     private fun handleTouch(event: MotionEvent): Boolean {
         when (event.actionMasked) {
@@ -626,9 +630,37 @@ class MyKeyboardIME : InputMethodService() {
         return true
     }
 
+    /** Letter keys still held down, oldest first: typed, but not yet committed. */
+    private fun heldLetterTouches(): List<TouchState> {
+        val held = ArrayList<TouchState>()
+        for (i in 0 until touches.size()) {
+            val t = touches.valueAt(i)
+            val k = t.key ?: continue
+            if (!t.consumed && k.config.action == KeyAction.CHAR) held.add(t)
+        }
+        held.sortBy { it.seq }
+        return held
+    }
+
     private fun pointerDown(id: Int, x: Float, y: Float) {
-        val target = resolveKeyAt(x.toInt(), y.toInt())
-        val state = TouchState(target, x, y)
+        // In fast typing the next finger lands before the last one lifts, so that
+        // last letter isn't typed yet. Judge this touch as if it were: after "a",
+        // N should win over B because of "and", not because of how words start.
+        val held = heldLetterTouches()
+        val target = if (held.isEmpty()) {
+            resolveKeyAt(x.toInt(), y.toInt(), letterPrior, letterPriorMax)
+        } else {
+            val pending = StringBuilder(currentWord)
+            var wordEnded = false
+            for (t in held) {
+                val c = letterOf(t.key!!.config)
+                if (c == null) wordEnded = true else pending.append(c)
+            }
+            val prior = if (wordEnded || !priorActive()) emptyMap()
+            else WordPredictor.letterDistribution(previousWord, pending.toString())
+            resolveKeyAt(x.toInt(), y.toInt(), prior, prior.values.maxOrNull() ?: 0.0)
+        }
+        val state = TouchState(target, x, y, ++touchSeq)
         touches.put(id, state)
         if (target == null) return
         target.setPressedVisual(true)
@@ -647,6 +679,8 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun pointerMove(id: Int, x: Float, y: Float) {
         val state = touches.get(id) ?: return
+        state.lastX = x
+        state.lastY = y
         val key = state.key ?: return
         if (key.config.action != KeyAction.SPACE || state.spaceGesture) return
         val dx = x - state.downX
@@ -683,6 +717,15 @@ class MyKeyboardIME : InputMethodService() {
         holdRunnable?.let { uiHandler.removeCallbacks(it) }
         holdRunnable = null
         val key = state.key ?: return
+        // A finger that landed earlier but is still down gets typed first, so
+        // letters always come out in the order they were pressed ("an", not "na").
+        if (!state.backspace && !state.consumed && !state.spaceGesture) {
+            for (t in heldLetterTouches()) {
+                if (t.seq >= state.seq) break
+                t.consumed = true
+                t.key?.resolveGesture(t.lastX - t.downX, t.lastY - t.downY)
+            }
+        }
         when {
             state.backspace -> key.setPressedVisual(false)
             state.consumed -> key.setPressedVisual(false)
@@ -806,7 +849,7 @@ class MyKeyboardIME : InputMethodService() {
         return rects
     }
 
-    private fun resolveKeyAt(x: Int, y: Int): KeyView? {
+    private fun resolveKeyAt(x: Int, y: Int, prior: Map<Char, Double>, priorMax: Double): KeyView? {
         val root = builtRoot ?: return null
         // Key positions only change when the layout does, so measure them once per layout.
         val rects = keyRects ?: buildKeyRects(root)
@@ -819,7 +862,7 @@ class MyKeyboardIME : InputMethodService() {
         }
         // Space, shift, backspace and the rest are exactly where they are drawn.
         if (hit != null && letterOf(hit.config) == null) return hit
-        return chooseLetterKey(x, y, hit)
+        return chooseLetterKey(x, y, hit, prior, priorMax)
     }
 
     /**
@@ -828,7 +871,9 @@ class MyKeyboardIME : InputMethodService() {
      * always types that key. Only near the line between two keys does the
      * expected letter tip the choice, and the strength setting says how much.
      */
-    private fun chooseLetterKey(x: Int, y: Int, hit: KeyView?): KeyView? {
+    private fun chooseLetterKey(
+        x: Int, y: Int, hit: KeyView?, letterPrior: Map<Char, Double>, letterPriorMax: Double
+    ): KeyView? {
         val strength = predictionStrength
         if (hit != null && (strength <= 0 || letterPriorMax <= 0.0)) return hit
         val weight = 0.7 * strength / 100.0
@@ -1211,8 +1256,12 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     /** Keeps the touch model's idea of the next letter current. Cheap, so it runs on every keystroke. */
+    /** Whether the word model should steer touches at all right now. */
+    private fun priorActive(): Boolean =
+        predictionStrength > 0 && !gifMode && autocorrectAllowed && page == KeyboardPage.LETTERS
+
     private fun refreshLetterPrior() {
-        if (predictionStrength <= 0 || gifMode || !autocorrectAllowed || page != KeyboardPage.LETTERS) {
+        if (!priorActive()) {
             letterPrior = emptyMap()
             letterPriorMax = 0.0
             return
