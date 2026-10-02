@@ -1,0 +1,13 @@
+sentences 2037234, words 15728504
+pairs kept 150000 in 18310 contexts
+triples kept 150000 in 53783 contexts
+after '<s>': i 301817, the 102535, he 87928, she 49484, you 49408, sami 48739, i'm 46918, we 45907
+after 'and': i 7828, the 5446, rima 3004, a 2733, layla 2726, his 1647, he 1574, then 1297
+after 'i': don't 39689, think 20878, know 19686, was 17984, have 17553, didn't 17365, want 11773, thought 10472
+after 'a': lot 14814, good 9179, little 7039, very 5593, new 5181, few 4882, long 3893, bit 3044
+after 'the': same 7731, only 6367, first 5740, one 5686, world 5536, door 5149, way 4382, last 4332
+after 'to': do 73613, be 35396, the 30030, go 18389, get 12654, help 9537, see 8176, me 7773
+after '<s> i': don't 35209, think 19291, know 17435, didn't 14380, have 12314, was 10224, thought 9463, want 9377
+after 'i want': to 7711, you 1343, a 484, my 114, him 102, is 99, the 91, this 71
+after 'going to': be 5062, do 3281, the 1132, have 1112, happen 1047, get 1027, go 992, boston 691
+after 'how are': you 448, we 118, things 55, your 26, they 24, the 19, these 3, my 2
