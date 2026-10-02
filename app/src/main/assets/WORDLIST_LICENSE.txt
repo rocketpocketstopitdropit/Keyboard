@@ -1,0 +1,11 @@
+wordlist.txt is generated during the build by scripts/make_wordlist.py from
+wordfreq (https://github.com/rspeer/wordfreq) by Robyn Speer.
+
+wordfreq's word frequency data is licensed under the Creative Commons
+Attribution-ShareAlike 4.0 license (CC BY-SA 4.0):
+https://creativecommons.org/licenses/by-sa/4.0/
+
+It is built from Wikipedia, Subtitles (OpenSubtitles and SUBTLEX), News
+(NewsCrawl and GDELT), Books (Google Books Ngrams), Web text (OSCAR),
+Twitter, and Reddit. See the wordfreq README for the full list of sources
+and their own licenses.

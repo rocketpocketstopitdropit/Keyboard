@@ -1046,8 +1046,9 @@ class MyKeyboardIME : InputMethodService() {
     private fun isApostrophe(c: Char): Boolean = c == '\'' || c == '\u2019'
 
     /**
-     * The word just ended: learn it (after the previous word), make it the
-     * new previous word, and start a fresh current word.
+     * The word just ended: learn it (after the previous word), add it to the
+     * context (the last two words, which the predictor uses), and start a
+     * fresh current word.
      */
     private fun finishWord(word: String, weight: Float) {
         val bare = word.trimEnd('\'', '\u2019')
@@ -1056,7 +1057,7 @@ class MyKeyboardIME : InputMethodService() {
                 WordPredictor.learn(previousWord, bare, weight)
                 scheduleFlush()
             }
-            previousWord = WordPredictor.normalize(bare)
+            previousWord = WordPredictor.pushContext(previousWord, bare)
         }
         currentWord.clear()
     }

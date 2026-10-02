@@ -1,28 +1,51 @@
-// >>>>>>>> PART 1 OF 2 (about 13,792 characters): START COPYING ON THE NEXT LINE (start a fresh, empty file) >>>>>>>>
 package com.example.customkeyboard
 
 import android.content.Context
 import kotlin.math.ln
+import kotlin.math.pow
 
 /**
- * Word model: a hand-built prior (Zipf-ranked word list plus a curated
- * table of "previous word -> likely next word" pairs) blended with what
- * the keyboard has learned from the person's own typing
- * (see [UserLanguageModel]).
+ * Word model with three levels, blended together:
  *
- * For any word w after previous word p:
+ *  - word frequency (assets/wordlist.txt, or a Zipf-ranked built-in list
+ *    if that file is missing),
+ *  - word pairs: what follows the last word (assets/ngrams.txt, mixed with
+ *    a small hand-curated table),
+ *  - word triples: what follows the last two words (assets/ngrams.txt),
  *
- *   unigram(w)   = (1 - a) * zipf(w) + a * userFrequency(w)
- *   bigram(w|p)  = (1 - b) * curated(w|p) + b * userBigram(w|p)
- *   P(w | p)     = L * bigram(w|p) + (1 - L) * unigram(w)
+ * plus what the keyboard has learned from the person's own typing (see
+ * [UserLanguageModel]).
  *
- * where a and b grow as the person types more (so a brand-new install
- * behaves like the old fixed model, and a well-used one is personal), and
- * L is 0 when nothing is known about p.
+ * "Previous" arguments are a context of up to two words, oldest first
+ * ("how are", "<s> i"); build it with [pushContext]. A single word or ""
+ * still works. For a word w after context (p2, p1):
  *
- * Ranked word lists (one word per line, most common first) in
- * app/src/main/assets/ (wordlist.txt, wordlist2.txt, wordlist3.txt) are
- * appended after the built-in list automatically.
+ *   unigram(w)    = (1 - a) * prior(w) + a * userFrequency(w)
+ *   pair(w|p1)    = (1 - b) * corpus(w|p1) + b * userPair(w|p1)
+ *   pairMix(w)    = L2 * pair(w|p1) + (1 - L2) * unigram(w)
+ *   P(w | p2 p1)  = L3 * triple(w|p2 p1) + (1 - L3) * pairMix(w)
+ *
+ * a and b grow as the person types more. L2 and L3 come from how much
+ * corpus data there is for that context (Witten-Bell: seen / (seen +
+ * distinct followers)), so a well-attested context leans on its data and
+ * a rare one falls back to the level below. L3 also shrinks as the
+ * person's own habits after p1 build up, so personal patterns still win.
+ * Corpus n-grams load on a background thread; until they arrive (or if
+ * the file is missing) the curated pair table is used on its own.
+ *
+ * assets/wordlist.txt: one word per line, most common first, with an
+ * optional tab-separated Zipf value (log10 of uses per billion words, e.g.
+ * "the\t7.73"). With Zipf values those real frequencies are the prior;
+ * built-in words and the extra lists (wordlist2.txt, wordlist3.txt,
+ * wordlist4.txt) are added at the rarest listed frequency. Without Zipf
+ * values everything is ranked after the built-in words, as before.
+ * Built from wordfreq (CC BY-SA 4.0); see assets/WORDLIST_LICENSE.txt.
+ *
+ * assets/ngrams.txt (tab-separated), counted from real conversations (see
+ * assets/NGRAMS_LICENSE.txt):
+ *   C <context> <total> <distinct>  how much followed a context, and how many different words
+ *   B <word> <next> <count>         word pair
+ *   T <w1 w2> <next> <count>        word triple
  */
 object WordPredictor {
     // Only real words are ever predicted or suggested: the built-in dictionary,
@@ -36,7 +59,11 @@ object WordPredictor {
     private const val BIGRAM_WEIGHT = 0.7
     private const val MAX_USER_UNIGRAM_WEIGHT = 0.6
     private const val UNIGRAM_TRUST_SCALE = 300.0
-    private const val BIGRAM_TRUST_SCALE = 2.0
+    private const val MAX_USER_BIGRAM_WEIGHT = 0.6
+    private const val BIGRAM_TRUST_SCALE = 10.0
+    /** Share of a word pair's estimate given to the hand-curated table when corpus data exists too. */
+    private const val CURATED_SHARE = 0.3
+    private const val MAX_CONTEXT_WEIGHT = 0.9
     private const val FLOOR = 1e-7
 
     /** Words the person added have no frequency rank, so they get a fair mid-list one. */
@@ -208,6 +235,24 @@ object WordPredictor {
     private var rank: Map<String, Int> = buildRank(WORDS)
     private var harmonic: Double = harmonicSum(WORDS.size)
 
+    /** Real word frequencies (summing to 1) from wordlist.txt, or null to use rank. */
+    private var staticFreq: Map<String, Double>? = null
+
+    /** Prior for a word the person added, when real frequencies are in use. */
+    private var addedWordFreq = 0.0
+
+    /** Word pairs and triples counted from real conversations. */
+    private class NgramTables(
+        val pairs: Map<String, Map<String, Float>>,
+        val triples: Map<String, Map<String, Float>>,
+        /** context -> [total count seen after it, number of different words seen after it] */
+        val contexts: Map<String, FloatArray>
+    )
+
+    /** Filled in by a background thread once assets/ngrams.txt is read. */
+    @Volatile
+    private var ngrams: NgramTables? = null
+
     /** Every usable word, sorted (so a prefix is one contiguous run) and bucketed by length. */
     private class VocabIndex(val sorted: Array<String>, val byLength: Array<List<String>>)
 
@@ -224,6 +269,42 @@ object WordPredictor {
         // Earlier versions also remembered words that aren't real words; forget those.
         user.retainWords { it == START || isKnown(it) }
         index = null
+        loadNgramsInBackground(app)
+    }
+
+    private fun loadNgramsInBackground(context: Context) {
+        Thread({
+            try {
+                val pairs = HashMap<String, HashMap<String, Float>>(8192)
+                val triples = HashMap<String, HashMap<String, Float>>(16384)
+                val contexts = HashMap<String, FloatArray>(32768)
+                // Share one String object per distinct word to save memory.
+                val pool = HashMap<String, String>(32768)
+                fun shared(s: String): String = pool.getOrPut(s) { s }
+
+                context.assets.open("ngrams.txt").bufferedReader().useLines { lines ->
+                    for (line in lines) {
+                        val parts = line.split('\t')
+                        if (parts.size != 4) continue
+                        when (parts[0]) {
+                            "C" -> {
+                                val total = parts[2].toFloatOrNull() ?: continue
+                                val distinct = parts[3].toFloatOrNull() ?: continue
+                                contexts[shared(parts[1])] = floatArrayOf(total, distinct)
+                            }
+                            "B", "T" -> {
+                                val count = parts[3].toFloatOrNull() ?: continue
+                                val table = if (parts[0] == "B") pairs else triples
+                                table.getOrPut(shared(parts[1])) { HashMap() }[shared(parts[2])] = count
+                            }
+                        }
+                    }
+                }
+                ngrams = NgramTables(pairs, triples, contexts)
+            } catch (e: Exception) {
+                // No file or a damaged one: keep using the curated pairs.
+            }
+        }, "ngram-loader").start()
     }
 
     private fun buildRank(words: List<String>): Map<String, Int> {
@@ -238,31 +319,83 @@ object WordPredictor {
         return s
     }
 
+    private fun readList(context: Context, name: String): List<String> =
+        try {
+            context.assets.open(name).bufferedReader().use { it.readLines() }
+        } catch (e: Exception) {
+            emptyList() // A missing file just means fewer words.
+        }
+
     private fun loadAssetWords(context: Context) {
-        val merged = LinkedHashSet<String>(WORDS)
-        // The word list can be split across up to three files (most common first).
-        for (name in listOf("wordlist.txt", "wordlist2.txt", "wordlist3.txt")) {
-            try {
-                val lines = context.assets.open(name).bufferedReader().use { it.readLines() }
-                for (line in lines) {
-                    val w = normalize(line.substringBefore('\t').trim())
-                    if (isLearnable(w)) merged.add(w)
-                }
-            } catch (e: Exception) {
-                // A missing file just means fewer words.
+        // wordlist.txt: word -> frequency (uses per word of text), or null if the line had no Zipf value.
+        val listed = LinkedHashMap<String, Double?>()
+        for (line in readList(context, "wordlist.txt")) {
+            val w = normalize(line.substringBefore('\t').trim())
+            if (!isLearnable(w) || listed.containsKey(w)) continue
+            val zipf = line.substringAfter('\t', "").trim().toDoubleOrNull()
+            listed[w] = zipf?.let { 10.0.pow(it - 9.0) }
+        }
+        // Extra lists without frequencies, most common first.
+        val extras = LinkedHashSet<String>()
+        for (name in listOf("wordlist2.txt", "wordlist3.txt", "wordlist4.txt")) {
+            for (line in readList(context, name)) {
+                val w = normalize(line.substringBefore('\t').trim())
+                if (isLearnable(w)) extras.add(w)
             }
         }
-        staticWords = merged.toList()
+
+        val rarest = listed.values.filterNotNull().minOrNull()
+        if (rarest == null) {
+            // No frequencies: rank everything after the built-in words, as before.
+            val merged = LinkedHashSet<String>(WORDS)
+            merged.addAll(listed.keys)
+            merged.addAll(extras)
+            staticWords = merged.toList()
+            staticFreq = null
+        } else {
+            // Real frequencies: wordlist.txt's order wins; built-in and extra words it
+            // lacks (and lines missing a value) get the rarest listed frequency.
+            val freq = LinkedHashMap<String, Double>(listed.size + WORDS.size + extras.size)
+            for ((w, f) in listed) freq[w] = f ?: rarest
+            for (w in WORDS) if (!freq.containsKey(w)) freq[w] = rarest
+            for (w in extras) if (!freq.containsKey(w)) freq[w] = rarest
+            val sum = freq.values.sum()
+            for (e in freq.entries) e.setValue(e.value / sum)
+            staticWords = freq.keys.toList()
+            staticFreq = freq
+            // Added words get the frequency of a fairly common word, like their old mid-list rank.
+            addedWordFreq = freq[staticWords[minOf(ADDED_WORD_RANK, staticWords.size - 1)]] ?: 0.0
+        }
         rank = buildRank(staticWords)
         harmonic = harmonicSum(staticWords.size)
     }
 
     // ---------- text hygiene ----------
 
-    fun normalize(word: String): String = word.lowercase().replace('\u2019', '\'')
+    fun normalize(word: String): String = word.lowercase().replace('’', '\'')
 
-// <<<<<<<< END OF PART 1 OF 2: STOP COPYING ON THE PREVIOUS LINE <<<<<<<<
-// >>>>>>>> PART 2 OF 2 (about 10,938 characters): START COPYING ON THE NEXT LINE (paste straight below part 1) >>>>>>>>
+    /**
+     * The context after [word] is typed following [context]: the last two
+     * words, oldest first. Keep passing the result back in as "previous".
+     */
+    fun pushContext(context: String, word: String): String {
+        val w = normalize(word).trim()
+        if (w.isEmpty()) return context
+        val last = lastWord(context)
+        return if (last.isEmpty()) w else "$last $w"
+    }
+
+    /** The most recent word of a context ("how are" -> "are"). */
+    private fun lastWord(context: String): String =
+        normalize(context).trim().substringAfterLast(' ')
+
+    /** The word before the most recent one, or "" if there isn't one. */
+    private fun wordBeforeLast(context: String): String {
+        val t = normalize(context).trim()
+        val i = t.lastIndexOf(' ')
+        return if (i < 0) "" else t.substring(0, i).substringAfterLast(' ')
+    }
+
     /** Only plain words (letters, with an inner apostrophe) are worth keeping. */
     private fun isLearnable(w: String): Boolean {
         if (w.isEmpty() || w.length > MAX_WORD_LEN) return false
@@ -353,32 +486,59 @@ object WordPredictor {
 
     private class PredictionContext(
         val curated: Map<String, Double>,
+        /** Corpus counts of what followed the last word, and their total. */
+        val pairRow: Map<String, Float>?,
+        val pairTotal: Double,
+        /** Corpus counts of what followed the last two words, and their total. */
+        val tripleRow: Map<String, Float>?,
+        val tripleTotal: Double,
         val userRow: Map<String, Float>?,
         val userRowTotal: Double,
         val beta: Double,
-        val lambda: Double,
+        /** Weight of the word-pair level over plain frequency. */
+        val lambda2: Double,
+        /** Weight of the word-triple level over everything below it. */
+        val lambda3: Double,
         val alpha: Double,
         val userTotal: Double
     )
 
     private var cachedPrev: String? = null
     private var cachedVersion = -1
+    private var cachedTables: NgramTables? = null
     private var cachedContext: PredictionContext? = null
 
     /** One keystroke asks for this several times with the same inputs, so remember the last answer. */
     private fun contextFor(previous: String): PredictionContext {
         val prev = normalize(previous)
         val cached = cachedContext
-        if (cached != null && cachedPrev == prev && cachedVersion == user.dataVersion) return cached
+        val tables = ngrams
+        if (cached != null && cachedPrev == prev && cachedVersion == user.dataVersion &&
+            cachedTables === tables
+        ) {
+            return cached
+        }
         val built = buildContext(prev)
         cachedPrev = prev
         cachedVersion = user.dataVersion
+        cachedTables = tables
         cachedContext = built
         return built
     }
 
-    private fun buildContext(prev: String): PredictionContext {
-        val curatedRaw = bigrams[prev]
+    /** Witten-Bell weight: how much to trust what followed a context in the corpus. */
+    private fun contextWeight(info: FloatArray?): Double {
+        if (info == null || info[0] <= 0f) return 0.0
+        val seen = info[0].toDouble()
+        return minOf(MAX_CONTEXT_WEIGHT, seen / (seen + info[1]))
+    }
+
+    private fun buildContext(previous: String): PredictionContext {
+        val p1 = lastWord(previous)
+        val p2 = wordBeforeLast(previous)
+        val tables = ngrams
+
+        val curatedRaw = bigrams[p1]
         val curated: Map<String, Double> = if (curatedRaw == null) {
             emptyMap()
         } else {
@@ -386,42 +546,86 @@ object WordPredictor {
             curatedRaw.associate { it.first to it.second / sum }
         }
 
-        val row = user.bigramRow(prev)
+        val pairInfo = if (p1.isEmpty()) null else tables?.contexts?.get(p1)
+        val pairRow = if (p1.isEmpty()) null else tables?.pairs?.get(p1)
+        val tripleKey = "$p2 $p1"
+        val tripleInfo = if (p2.isEmpty() || p1.isEmpty()) null else tables?.contexts?.get(tripleKey)
+        val tripleRow = if (tripleInfo == null) null else tables?.triples?.get(tripleKey)
+
+        val row = user.bigramRow(p1)
         val rowTotal = row?.values?.sum()?.toDouble() ?: 0.0
-        val beta = if (rowTotal > 0.0) minOf(0.9, rowTotal / (rowTotal + BIGRAM_TRUST_SCALE)) else 0.0
-        val hasEvidence = curated.isNotEmpty() || rowTotal > 0.0
+        val beta = if (rowTotal > 0.0) {
+            minOf(MAX_USER_BIGRAM_WEIGHT, rowTotal / (rowTotal + BIGRAM_TRUST_SCALE))
+        } else {
+            0.0
+        }
+
+        val lambda2 = when {
+            pairRow != null -> contextWeight(pairInfo)
+            curated.isNotEmpty() || rowTotal > 0.0 -> BIGRAM_WEIGHT
+            else -> 0.0
+        }
+        // The person's own habits after p1 shrink the triple level, so they aren't drowned out.
+        val lambda3 = if (tripleRow != null) contextWeight(tripleInfo) * (1.0 - beta) else 0.0
 
         val total = user.unigramTotal().toDouble()
         val alpha = if (total > 0.0) minOf(MAX_USER_UNIGRAM_WEIGHT, total / (total + UNIGRAM_TRUST_SCALE)) else 0.0
 
         return PredictionContext(
             curated = curated,
+            pairRow = pairRow,
+            pairTotal = pairInfo?.get(0)?.toDouble() ?: 0.0,
+            tripleRow = tripleRow,
+            tripleTotal = tripleInfo?.get(0)?.toDouble() ?: 0.0,
             userRow = row,
             userRowTotal = rowTotal,
             beta = beta,
-            lambda = if (hasEvidence) BIGRAM_WEIGHT else 0.0,
+            lambda2 = lambda2,
+            lambda3 = lambda3,
             alpha = alpha,
             userTotal = total
         )
     }
 
-    private fun probability(word: String, ctx: PredictionContext): Double {
-        val r: Int? = rank[word] ?: (if (user.isAdded(word)) ADDED_WORD_RANK else null)
-        val zipf = if (r == null) 0.0 else 1.0 / ((r + 1) * harmonic)
-        val userFreq = if (ctx.userTotal > 0.0) user.unigramCount(word) / ctx.userTotal else 0.0
-        val uni = (1.0 - ctx.alpha) * zipf + ctx.alpha * userFreq
+    /** How common [word] is in general, before anything learned from the person. */
+    private fun priorFrequency(word: String): Double {
+        val freq = staticFreq
+        if (freq != null) return freq[word] ?: (if (user.isAdded(word)) addedWordFreq else 0.0)
+        val r: Int = rank[word] ?: (if (user.isAdded(word)) ADDED_WORD_RANK else return 0.0)
+        return 1.0 / ((r + 1) * harmonic)
+    }
 
-        var bi = 0.0
-        if (ctx.lambda > 0.0) {
+    private fun probability(word: String, ctx: PredictionContext): Double {
+        val prior = priorFrequency(word)
+        val userFreq = if (ctx.userTotal > 0.0) user.unigramCount(word) / ctx.userTotal else 0.0
+        var p = (1.0 - ctx.alpha) * prior + ctx.alpha * userFreq
+
+        if (ctx.lambda2 > 0.0) {
             val cur = ctx.curated[word] ?: 0.0
+            val corpus = if (ctx.pairRow != null && ctx.pairTotal > 0.0) {
+                (ctx.pairRow[word] ?: 0f) / ctx.pairTotal
+            } else {
+                0.0
+            }
+            val general = when {
+                ctx.pairRow == null -> cur
+                ctx.curated.isEmpty() -> corpus
+                else -> (1.0 - CURATED_SHARE) * corpus + CURATED_SHARE * cur
+            }
             val usr = if (ctx.userRow != null && ctx.userRowTotal > 0.0) {
                 (ctx.userRow[word] ?: 0f) / ctx.userRowTotal
             } else {
                 0.0
             }
-            bi = (1.0 - ctx.beta) * cur + ctx.beta * usr
+            val pair = (1.0 - ctx.beta) * general + ctx.beta * usr
+            p = ctx.lambda2 * pair + (1.0 - ctx.lambda2) * p
         }
-        return ctx.lambda * bi + (1.0 - ctx.lambda) * uni + FLOOR
+
+        if (ctx.lambda3 > 0.0 && ctx.tripleRow != null && ctx.tripleTotal > 0.0) {
+            val triple = (ctx.tripleRow[word] ?: 0f) / ctx.tripleTotal
+            p = ctx.lambda3 * triple + (1.0 - ctx.lambda3) * p
+        }
+        return p + FLOOR
     }
 
     /** Overall frequency of a word (blended with the person's own usage). */
@@ -462,6 +666,7 @@ object WordPredictor {
     private var firstLetterPrev: String? = null
     private var firstLetterData = -1
     private var firstLetterVocab = -1
+    private var firstLetterTables: NgramTables? = null
     private var firstLetterCache: Map<Char, Double> = emptyMap()
 
     /**
@@ -473,8 +678,10 @@ object WordPredictor {
     fun letterDistribution(previousWord: String, prefix: String): Map<Char, Double> {
         val p = normalize(prefix)
         val prev = normalize(previousWord)
+        val tables = ngrams
         if (p.isEmpty() && firstLetterPrev == prev &&
-            firstLetterData == user.dataVersion && firstLetterVocab == user.vocabularyVersion
+            firstLetterData == user.dataVersion && firstLetterVocab == user.vocabularyVersion &&
+            firstLetterTables === tables
         ) {
             return firstLetterCache
         }
@@ -499,6 +706,7 @@ object WordPredictor {
             firstLetterPrev = prev
             firstLetterData = user.dataVersion
             firstLetterVocab = user.vocabularyVersion
+            firstLetterTables = tables
             firstLetterCache = result
         }
         return result
@@ -521,8 +729,8 @@ object WordPredictor {
     // ---------- learning ----------
 
     /**
-     * Record that [word] was typed after [previous]. Pass [START] (or "" if
-     * the context is unknown) for the previous word as appropriate. Words
+     * Record that [word] was typed after [previous] (a context from
+     * [pushContext], [START], or "" if the context is unknown). Words
      * that aren't real words are ignored.
      */
     fun learn(previous: String, word: String, weight: Float = 1f) {
@@ -537,8 +745,9 @@ object WordPredictor {
         user.unlearn(contextWord(previous), w, weight)
     }
 
+    /** The word learning is keyed on: the last word of the context. */
     private fun contextWord(previous: String): String {
-        val p = normalize(previous)
+        val p = lastWord(previous)
         return if (p == START || isKnown(p)) p else ""
     }
 
@@ -549,4 +758,3 @@ object WordPredictor {
     fun clearLearned(context: Context) = user.clear(context.applicationContext)
 
 }
-// <<<<<<<< END OF PART 2 OF 2: STOP COPYING ON THE PREVIOUS LINE - THAT IS THE WHOLE FILE <<<<<<<<
