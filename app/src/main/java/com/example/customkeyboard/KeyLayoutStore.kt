@@ -27,7 +27,33 @@ object KeyLayoutStore {
     private fun optIntOrNull(obj: JSONObject, key: String): Int? =
         if (obj.has(key) && !obj.isNull(key)) obj.getInt(key) else null
 
+    private const val LAYOUT_VERSION_KEY = "layout_version"
+    private const val LAYOUT_VERSION = 2
+
+    /**
+     * Layout 2 swapped enter and backspace: enter moved up into the notch and
+     * backspace down beside the bottom rows. Carry any customisations along
+     * with the key they were made to (old notch -> new backspace spot, old
+     * enter spot -> notch). Runs again after restoring an older backup.
+     */
+    private fun migrate(context: Context) {
+        val p = prefs(context)
+        if (p.getInt(LAYOUT_VERSION_KEY, 1) >= LAYOUT_VERSION) return
+        run {
+            val oldBackspace = p.getString(keyFor(-1, 0), null)
+            val oldEnter = p.getString(keyFor(3, 4), null)
+            val e = p.edit()
+            e.remove(keyFor(-1, 0))
+            e.remove(keyFor(3, 4))
+            if (oldBackspace != null) e.putString(keyFor(2, 8), oldBackspace)
+            if (oldEnter != null) e.putString(keyFor(-1, 0), oldEnter)
+            e.putInt(LAYOUT_VERSION_KEY, LAYOUT_VERSION)
+            e.apply()
+        }
+    }
+
     fun getOverride(context: Context, row: Int, col: Int): KeyOverride? {
+        migrate(context)
         val json = prefs(context).getString(keyFor(row, col), null) ?: return null
         return try {
             val obj = JSONObject(json)

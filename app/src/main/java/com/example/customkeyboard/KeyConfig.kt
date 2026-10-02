@@ -14,7 +14,10 @@ data class KeyConfig(
     val heightDp: Int? = null,
     // What actually gets typed, if different from the visible label
     // (used for clipboard entries: short preview label, full pasted text here).
-    val commitOverride: String? = null
+    val commitOverride: String? = null,
+    // Last key of a row only: it also fills the same spot in the row below,
+    // making one tall key (the backspace beside the bottom two rows).
+    val spansTwoRows: Boolean = false
 )
 
 enum class KeyAction {
@@ -30,7 +33,9 @@ object KeyboardLayout {
     private fun plainW(weight: Float, vararg labels: String): List<KeyConfig> =
         labels.map { KeyConfig(it, weight = weight) }
 
-    val NOTCH_KEY = KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
+    val NOTCH_KEY = KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
+
+    private val BACKSPACE = KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
 
     /** The built-in key at this position. row = -1 is the notch key. */
     fun defaultFor(row: Int, col: Int): KeyConfig = if (row < 0) NOTCH_KEY else ROWS[row][col]
@@ -51,7 +56,7 @@ object KeyboardLayout {
         listOf(
             KeyConfig("ABC", weight = 1.5f, action = KeyAction.LETTERS),
             KeyConfig(" ", weight = 5f, action = KeyAction.SPACE),
-            KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
+            BACKSPACE
         )
     )
 
@@ -63,8 +68,15 @@ object KeyboardLayout {
         listOf(
             KeyConfig("ABC", weight = 1.5f, action = KeyAction.LETTERS),
             KeyConfig(" ", weight = 5f, action = KeyAction.SPACE),
-            KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
+            BACKSPACE
         )
+    )
+
+    /** Bottom row of the emoji and clipboard pages: back to letters on the left, backspace on the right. */
+    val PICKER_BOTTOM_ROW: List<KeyConfig> = listOf(
+        KeyConfig("ABC", weight = 2f, action = KeyAction.LETTERS),
+        KeyConfig("", weight = 4f, action = KeyAction.SPACER),
+        BACKSPACE.copy(weight = 2f)
     )
 
     // Emoji picker page — flat grid, 8 per row.
@@ -82,7 +94,7 @@ object KeyboardLayout {
         plain("☕", "🍕", "🍔", "🍟", "🍎", "🍺", "🍾", "🎂"),
         plain("⚽", "🏀", "🏈", "🎮", "🎧", "🚗", "✈️", "🏠"),
         plain("🌙", "☀️", "⛅", "🌧️", "❄️", "🌈", "⚡", "🎄"),
-        listOf(KeyConfig("ABC", weight = 2f, action = KeyAction.LETTERS))
+        PICKER_BOTTOM_ROW
     )
 
     val ROWS: List<List<KeyConfig>> = listOf(
@@ -106,17 +118,15 @@ object KeyboardLayout {
             KeyConfig("c", weight = 1.2f), KeyConfig("v", weight = 1.2f),
             KeyConfig("b", weight = 1.2f), KeyConfig("n", weight = 1.2f),
             KeyConfig("m", weight = 1.2f),
-            // Invisible filler so "m" lands where a traditional keyboard has it,
-            // instead of stretching all the way to the edge now that backspace
-            // moved up into the notch.
-            KeyConfig("", weight = 1.5f, action = KeyAction.SPACER)
+            // Backspace where it traditionally sits, running down past the
+            // bottom row into the corner (enter lives in the notch up top).
+            BACKSPACE.copy(spansTwoRows = true)
         ),
         listOf(
             KeyConfig("123", weight = 1.5f, action = KeyAction.SYMBOLS),
             KeyConfig(",", topLeft = "!", topRight = "?"),
             KeyConfig(" ", weight = 4f, action = KeyAction.SPACE),
-            KeyConfig(".", topLeft = ";", topRight = ":"),
-            KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
+            KeyConfig(".", topLeft = ";", topRight = ":")
         )
     )
 }

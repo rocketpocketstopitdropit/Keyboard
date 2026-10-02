@@ -16,7 +16,7 @@ import android.widget.TextView
 enum class KeyboardPage { LETTERS, SYMBOLS_1, SYMBOLS_2, EMOJI, CLIPBOARD }
 enum class AccessoryAction { SETTINGS, GIF, EMOJI, CLIPBOARD, MIC }
 
-/** Where an editable key lives. row = -1 is the backspace key in the top-right notch. */
+/** Where an editable key lives. row = -1 is the enter key in the top-right notch. */
 data class KeyAddress(val row: Int, val col: Int)
 
 class BuiltKeyboard(
@@ -52,7 +52,7 @@ fun KeyView.rawHitRectIn(root: View): Rect = offsetToRoot(rawLocalRect(), this, 
 
 /**
  * Builds the whole keyboard: a top strip (accessory icons on the left, the
- * backspace notch on the right), then the panel of key rows. The real
+ * enter-key notch on the right), then the panel of key rows. The real
  * keyboard and the Edit Keys preview both use this, so the preview always
  * matches what you actually type on. Each editable key carries its
  * KeyAddress in `tag`.
@@ -107,7 +107,7 @@ object KeyboardBuilder {
 
         val root = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
 
-        // ----- Top strip: accessory icons (left) + backspace notch (right) -----
+        // ----- Top strip: accessory icons (left) + enter-key notch (right) -----
         val topRow = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             weightSum = 10f
@@ -199,20 +199,25 @@ object KeyboardBuilder {
         }
         root.addView(panel, LinearLayout.LayoutParams(matchParent, wrapContent))
 
-        fun addRow(configs: List<KeyConfig>, rowIndex: Int?) {
+        /** Centres [content] using the "Key width" setting, with empty space either side. */
+        fun widthWrapped(content: View): LinearLayout {
             val side = (100 - keyWidthPct) / 2f
             val wrapper = LinearLayout(context).apply {
                 orientation = LinearLayout.HORIZONTAL
                 weightSum = 100f
             }
             wrapper.addView(View(context), LinearLayout.LayoutParams(0, 1, side))
-            val rowLayout = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
-            wrapper.addView(
-                rowLayout,
-                LinearLayout.LayoutParams(0, wrapContent, keyWidthPct.toFloat())
-            )
+            wrapper.addView(content, LinearLayout.LayoutParams(0, wrapContent, keyWidthPct.toFloat()))
             wrapper.addView(View(context), LinearLayout.LayoutParams(0, 1, side))
+            return wrapper
+        }
 
+        fun rowParams() = LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+            topMargin = dp(keySpacing)
+            bottomMargin = dp(keySpacing)
+        }
+
+        fun fillRow(rowLayout: LinearLayout, configs: List<KeyConfig>, rowIndex: Int?) {
             configs.forEachIndexed { col, cfg ->
                 val rowHeight = dp(cfg.heightDp ?: keyHeight)
                 if (cfg.action == KeyAction.SPACER) {
@@ -234,20 +239,72 @@ object KeyboardBuilder {
                     )
                 }
             }
-            panel.addView(
-                wrapper,
-                LinearLayout.LayoutParams(matchParent, wrapContent).apply {
-                    topMargin = dp(keySpacing)
-                    bottomMargin = dp(keySpacing)
+        }
+
+        fun addRow(configs: List<KeyConfig>, rowIndex: Int?) {
+            val rowLayout = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            fillRow(rowLayout, configs, rowIndex)
+            panel.addView(widthWrapped(rowLayout), rowParams())
+        }
+
+        /**
+         * Two rows side by side with one tall key: the upper row's last key
+         * runs down beside the lower row. The upper row keeps its exact
+         * spacing; the lower row stretches to fill the width left of the tall key.
+         */
+        fun addRowPair(upper: List<KeyConfig>, upperIndex: Int?, lower: List<KeyConfig>, lowerIndex: Int?) {
+            val tall = upper.last()
+            val upperRest = upper.dropLast(1)
+
+            val top = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            fillRow(top, upperRest, upperIndex)
+            val bottom = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            fillRow(bottom, lower, lowerIndex)
+            val left = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+            // Same gap between the two rows as between any other pair of rows.
+            left.addView(top, LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+                bottomMargin = dp(keySpacing)
+            })
+            left.addView(bottom, LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+                topMargin = dp(keySpacing)
+            })
+
+            val block = LinearLayout(context).apply { orientation = LinearLayout.HORIZONTAL }
+            val restWeight = upperRest.sumOf { it.weight.toDouble() }.toFloat()
+            block.addView(left, LinearLayout.LayoutParams(0, wrapContent, restWeight))
+            val address = if (upperIndex != null) KeyAddress(upperIndex, upper.lastIndex) else null
+            block.addView(
+                makeKey(tall, address),
+                // Fills the full height of both rows.
+                LinearLayout.LayoutParams(0, matchParent, tall.weight).apply {
+                    marginStart = dp(keySpacing)
+                    marginEnd = dp(keySpacing)
                 }
             )
+            panel.addView(widthWrapped(block), rowParams())
+        }
+
+        /** Adds rows in order, pairing a row that ends in a tall key with the row below it. */
+        fun addRows(rows: List<List<KeyConfig>>, indexed: Boolean) {
+            var i = 0
+            while (i < rows.size) {
+                val row = rows[i]
+                val index = if (indexed) i else null
+                if (row.isNotEmpty() && row.last().spansTwoRows && i + 1 < rows.size) {
+                    addRowPair(row, index, rows[i + 1], if (indexed) i + 1 else null)
+                    i += 2
+                } else {
+                    addRow(row, index)
+                    i++
+                }
+            }
         }
 
         fun clipboardRows(): List<List<KeyConfig>> {
             if (clipboardHistory.isEmpty()) {
                 return listOf(
                     listOf(KeyConfig("Nothing copied yet", weight = 4f, action = KeyAction.SPACER)),
-                    listOf(KeyConfig("ABC", weight = 2f, action = KeyAction.LETTERS))
+                    KeyboardLayout.PICKER_BOTTOM_ROW
                 )
             }
             val rows = clipboardHistory.chunked(2).map { pair ->
@@ -256,25 +313,21 @@ object KeyboardBuilder {
                     KeyConfig(preview, weight = 2f, commitOverride = full)
                 }
             }
-            return rows + listOf(listOf(KeyConfig("ABC", weight = 2f, action = KeyAction.LETTERS)))
+            return rows + listOf(KeyboardLayout.PICKER_BOTTOM_ROW)
         }
 
         when (page) {
             KeyboardPage.LETTERS -> {
                 if (showNumberRow) addRow(KeyboardLayout.NUMBER_ROW, null)
-                KeyboardLayout.ROWS.forEachIndexed { rowIndex, row ->
-                    addRow(
-                        row.mapIndexed { col, def ->
-                            KeyLayoutStore.effectiveConfig(context, rowIndex, col, def)
-                        },
-                        rowIndex
-                    )
+                val rows = KeyboardLayout.ROWS.mapIndexed { rowIndex, row ->
+                    row.mapIndexed { col, def -> KeyLayoutStore.effectiveConfig(context, rowIndex, col, def) }
                 }
+                addRows(rows, indexed = true)
             }
-            KeyboardPage.SYMBOLS_1 -> KeyboardLayout.SYMBOLS_1.forEach { addRow(it, null) }
-            KeyboardPage.SYMBOLS_2 -> KeyboardLayout.SYMBOLS_2.forEach { addRow(it, null) }
-            KeyboardPage.EMOJI -> KeyboardLayout.EMOJI_ROWS.forEach { addRow(it, null) }
-            KeyboardPage.CLIPBOARD -> clipboardRows().forEach { addRow(it, null) }
+            KeyboardPage.SYMBOLS_1 -> addRows(KeyboardLayout.SYMBOLS_1, indexed = false)
+            KeyboardPage.SYMBOLS_2 -> addRows(KeyboardLayout.SYMBOLS_2, indexed = false)
+            KeyboardPage.EMOJI -> addRows(KeyboardLayout.EMOJI_ROWS, indexed = false)
+            KeyboardPage.CLIPBOARD -> addRows(clipboardRows(), indexed = false)
         }
 
         return BuiltKeyboard(root, keys, letterKeys, micButton, stripHost, iconStrip, suggestionStrip, suggestionViews)
