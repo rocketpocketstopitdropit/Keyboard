@@ -1,0 +1,55 @@
+name: Language data
+
+# Builds the word list (wordfreq) and the word-pair table (Tatoeba sentences)
+# and commits them to the branch, so the app build just uses the files.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, 'claude/**' ]
+    paths:
+      - 'scripts/make_wordlist.py'
+      - 'scripts/make_ngrams.py'
+      - '.github/workflows/language-data.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Word list
+        run: |
+          pip install wordfreq
+          python scripts/make_wordlist.py app/src/main/assets/wordlist.txt 100000
+
+      - name: Download sentences
+        run: |
+          curl -fsSL --retry 3 -o eng_sentences.tsv.bz2 \
+            https://downloads.tatoeba.org/exports/per_language/eng/eng_sentences.tsv.bz2
+          ls -l eng_sentences.tsv.bz2
+
+      - name: Word pairs and triples
+        run: |
+          python scripts/make_ngrams.py eng_sentences.tsv.bz2 \
+            app/src/main/assets/ngrams.txt scripts/ngram_stats.txt
+          ls -l app/src/main/assets
+
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898299+github-actions[bot]@users.noreply.github.com"
+          git add app/src/main/assets/wordlist.txt app/src/main/assets/ngrams.txt scripts/ngram_stats.txt
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update word list and word pairs"
+            git push
+          fi

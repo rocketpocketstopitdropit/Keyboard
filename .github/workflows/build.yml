@@ -16,11 +16,12 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Generate word list
+      - name: Generate word list (only if it isn't committed yet)
         run: |
-          pip install wordfreq
-          python scripts/make_wordlist.py app/src/main/assets/wordlist.txt 100000
-          head -5 app/src/main/assets/wordlist.txt
+          if [ ! -f app/src/main/assets/wordlist.txt ]; then
+            pip install wordfreq
+            python scripts/make_wordlist.py app/src/main/assets/wordlist.txt 100000
+          fi
           ls -l app/src/main/assets
 
       - name: Set up JDK 17
