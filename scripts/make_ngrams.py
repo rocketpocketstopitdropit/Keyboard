@@ -101,6 +101,10 @@ def overused(texts, vocab, zipf):
         here = math.log10(c / total * 1e9)
         if here - zipf.get(w, rarest) > limit:
             out.append((c, w))
+    # wordfreq undercounts contractions ("should've", "what're"), so keep them
+    # unless the word before the apostrophe is overused itself ("tom's").
+    flagged = {w for _, w in out}
+    out = [(c, w) for c, w in out if "'" not in w or w.split("'")[0] in flagged]
     out.sort(reverse=True)
     return out
 
