@@ -29,6 +29,7 @@ import android.view.Gravity
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import androidx.core.content.FileProvider
 import androidx.core.view.inputmethod.EditorInfoCompat
 import androidx.core.view.inputmethod.InputConnectionCompat
@@ -144,6 +145,9 @@ class MyKeyboardIME : InputMethodService() {
         return result
     }
 
+    /** False on Split Thumb, whose cursor key does the cursor moving instead. */
+    private var spaceBarMovesCursor = true
+
     private var hapticLevel = -1
     private var hapticEffect: Any? = null
 
@@ -192,7 +196,8 @@ class MyKeyboardIME : InputMethodService() {
             onTap = { cfg -> handleTap(cfg) },
             onFlick = { _, alt -> commitDirect(alt) },
             onAccessory = { action -> handleAccessory(action) },
-            onSuggestion = { word -> onSuggestionTapped(word) }
+            onSuggestion = { word -> onSuggestionTapped(word) },
+            onStripFlickUp = { if (!wordMode) enterWordMode() }
         )
         built.root.setOnTouchListener { _, event -> handleTouch(event) }
         built.root.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> keyRects = null }
@@ -210,7 +215,9 @@ class MyKeyboardIME : InputMethodService() {
         suggestionViews = built.suggestionViews
         suggestionsSeparate = built.separateSuggestions
         stripEndInset = built.stripEndInset
-        if (gifMode) attachGifPanel(built)
+        if (gifMode) attachGifPanel(built) else if (wordMode) attachWordPanel(built)
+        // Split Thumb has its own cursor key, so there the space bar only types spaces.
+        spaceBarMovesCursor = !KeyboardPrefs.getSplitLayout(this)
         allKeys.clear()
         allKeys.addAll(built.keys)
         letterKeys.clear()
@@ -230,6 +237,7 @@ class MyKeyboardIME : InputMethodService() {
     private val gifSearchRunnable = Runnable { runGifSearch() }
 
     private fun enterGifMode() {
+        stopWordMode()
         if (KeyboardPrefs.getKlipyKey(this).isBlank()) {
             Toast.makeText(
                 this,
@@ -492,6 +500,397 @@ class MyKeyboardIME : InputMethodService() {
         exitGifMode()
     }
 
+    // ---------- Word check (flick up on the suggestions) ----------
+
+    private var wordMode = false
+    private val wordQuery = StringBuilder()
+    private var wordQueryView: TextView? = null
+    private var wordHeaderView: TextView? = null
+    private var wordContent: LinearLayout? = null
+    private var wordScroll: ScrollView? = null
+    private var wordShowDefinitions = false
+    private var wordResults: List<WordInfo>? = null
+    /** Some words couldn't be looked up online and were checked against the keyboard's own dictionary. */
+    private var wordOffline = false
+    private var wordStatus: String? = null
+    private var wordToken = 0
+    private val wordCheckRunnable = Runnable { runWordCheck() }
+
+    private val goodColor = Color.parseColor("#6FD08C")
+    private val badColor = Color.parseColor("#FF8A80")
+
+    private fun enterWordMode() {
+        if (gifMode) stopGifMode()
+        page = KeyboardPage.LETTERS
+        currentWord.clear()
+        pendingCorrection = null
+        clearAutoSpace()
+        acceptWord = null
+        wordQuery.setLength(0)
+        wordResults = null
+        wordStatus = null
+        wordOffline = false
+        wordShowDefinitions = false
+        wordMode = true
+        populateKeyboard()
+    }
+
+    private fun exitWordMode() {
+        if (!wordMode) return
+        stopWordMode()
+        if (::keyboardContainer.isInitialized) populateKeyboard()
+        updatePrediction()
+    }
+
+    /** Turn word check off without rebuilding the keyboard (the caller does that). */
+    private fun stopWordMode() {
+        wordMode = false
+        wordQuery.setLength(0)
+        wordToken++
+        uiHandler.removeCallbacks(wordCheckRunnable)
+    }
+
+    /** A box in place of the hotkeys, and a panel above the keys for the answer. */
+    private fun attachWordPanel(built: BuiltKeyboard) {
+        built.iconStrip.visibility = View.GONE
+        built.suggestionStrip.visibility = View.GONE
+
+        val queryRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(4), dp(4), dp(2) + stripEndInset, 0)
+            setBackgroundColor(getColor(R.color.keyboard_background))
+        }
+        queryRow.addView(TextView(this).apply {
+            text = "✕"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(36))
+            setOnClickListener { exitWordMode() }
+        })
+        val queryView = TextView(this).apply {
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            maxLines = 1
+            // Long pasted text keeps its end (and the caret) in view.
+            ellipsize = android.text.TextUtils.TruncateAt.START
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f)
+        }
+        queryRow.addView(queryView)
+        queryRow.addView(TextView(this).apply {
+            text = "Paste"
+            textSize = 14f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), 0, dp(10), 0)
+            background = android.graphics.drawable.GradientDrawable().apply {
+                setColor(Color.argb(50, 255, 255, 255))
+                cornerRadius = dp(14).toFloat()
+            }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(30))
+            setOnClickListener { pasteIntoWordBox() }
+        })
+        built.stripHost.addView(
+            queryRow,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        )
+
+        val panel = SwipeFrame(this) { dir ->
+            // Right to left shows the definition; left to right goes back to spelling.
+            val defs = dir < 0
+            if (defs != wordShowDefinitions) {
+                wordShowDefinitions = defs
+                renderWordPanel()
+            }
+        }
+        panel.setBackgroundColor(getColor(R.color.keyboard_background))
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(4), dp(8), dp(4))
+        }
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val header = TextView(this).apply {
+            textSize = 11f
+            setTextColor(Color.LTGRAY)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        headerRow.addView(header)
+        headerRow.addView(TextView(this).apply {
+            text = "Type it ⏎"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            setPadding(dp(10), dp(4), dp(6), dp(4))
+            setOnClickListener { useWordFromBox() }
+        })
+        column.addView(headerRow)
+        val content = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            addView(content)
+        }
+        column.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        panel.addView(
+            column,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        )
+        // Index 1 = between the top strip and the key rows.
+        built.root.addView(panel, 1, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(140)))
+
+        wordQueryView = queryView
+        wordHeaderView = header
+        wordContent = content
+        wordScroll = scroll
+        updateWordQueryView()
+        renderWordPanel()
+    }
+
+    private fun updateWordQueryView() {
+        wordQueryView?.text = if (wordQuery.isEmpty()) {
+            "🔍  Type or paste a word"
+        } else {
+            "🔍  ${wordQuery}▏"
+        }
+    }
+
+    private fun scheduleWordCheck() {
+        updateWordQueryView()
+        uiHandler.removeCallbacks(wordCheckRunnable)
+        uiHandler.postDelayed(wordCheckRunnable, 600)
+    }
+
+    private fun pasteIntoWordBox() {
+        val clip = clipboardManager.primaryClip
+        val text = if (clip != null && clip.itemCount > 0) clip.getItemAt(0).coerceToText(this)?.toString() else null
+        val clean = text?.replace(Regex("\\s+"), " ")?.trim()?.take(200)
+        if (clean.isNullOrEmpty()) {
+            Toast.makeText(this, "Nothing copied to paste.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        wordQuery.setLength(0)
+        wordQuery.append(clean)
+        updateWordQueryView()
+        runWordCheck()
+    }
+
+    /** Puts what's in the box into the app being typed in, and closes the checker. */
+    private fun useWordFromBox() {
+        val text = wordQuery.toString().trim()
+        exitWordMode()
+        if (text.isEmpty()) return
+        currentInputConnection?.commitText("$text ", 1)
+        clearAutoSpace()
+        spaceAfterWord = true
+        lastWasSpace = false
+        lastCharWordish = false
+        updatePrediction()
+    }
+
+    /** In word check the keys type into the box, not into the app. */
+    private fun handleWordKey(config: KeyConfig): Boolean {
+        return when (config.action) {
+            KeyAction.CHAR -> {
+                val text = config.commitOverride ?: outputFor(config)
+                if (text.isNotEmpty()) {
+                    wordQuery.append(text)
+                    if (shiftState == ShiftState.ONCE) {
+                        shiftState = ShiftState.OFF
+                        shiftIsAuto = false
+                        refreshLabels()
+                    }
+                    scheduleWordCheck()
+                }
+                true
+            }
+            KeyAction.SPACE -> {
+                if (wordQuery.isNotEmpty() && wordQuery.last() != ' ') wordQuery.append(' ')
+                updateWordQueryView()
+                true
+            }
+            KeyAction.BACKSPACE -> {
+                if (wordQuery.isEmpty()) {
+                    exitWordMode()
+                } else {
+                    wordQuery.deleteCharAt(wordQuery.length - 1)
+                    scheduleWordCheck()
+                }
+                true
+            }
+            KeyAction.ENTER -> {
+                updateWordQueryView()
+                runWordCheck()
+                true
+            }
+            KeyAction.SYMBOLS, KeyAction.SYMBOLS_ALT, KeyAction.LETTERS -> {
+                // Switching pages leaves word check; the normal handler rebuilds the keyboard.
+                stopWordMode()
+                false
+            }
+            else -> true
+        }
+    }
+
+    private fun runWordCheck() {
+        uiHandler.removeCallbacks(wordCheckRunnable)
+        val words = WordLookup.wordsIn(wordQuery.toString())
+        val token = ++wordToken
+        if (words.isEmpty()) {
+            wordResults = null
+            wordStatus = null
+            renderWordPanel()
+            return
+        }
+        // Already looked up: show it straight away.
+        val known = words.map { WordLookup.cached(it) }
+        if (known.all { it != null }) {
+            wordResults = known.filterNotNull()
+            wordStatus = null
+            wordOffline = false
+            renderWordPanel()
+            return
+        }
+        wordStatus = "Checking…"
+        renderWordPanel()
+        WordLookup.runAsync {
+            val found = words.map { w -> try { WordLookup.lookup(w) } catch (e: Exception) { null } }
+            uiHandler.post {
+                if (token != wordToken || !wordMode) return@post
+                // Anything that couldn't be reached online is checked on the phone instead.
+                wordOffline = found.any { it == null }
+                wordResults = words.mapIndexed { i, w -> found[i] ?: localWordInfo(w) }
+                wordStatus = null
+                renderWordPanel()
+            }
+        }
+    }
+
+    /** The keyboard's own dictionary, for when the internet can't be reached. */
+    private fun localWordInfo(word: String): WordInfo {
+        val known = WordPredictor.isKnown(word)
+        val sugg = if (known) emptyList() else {
+            val out = ArrayList<String>()
+            Autocorrector.correctionFor(word.lowercase())?.let { out.add(it) }
+            for (w in WordPredictor.suggestions("", word.lowercase().take(3), 6)) {
+                if (w !in out && w != word.lowercase() && out.size < 5) out.add(w)
+            }
+            out
+        }
+        return WordInfo(word = word, found = known, suggestions = sugg)
+    }
+
+    private fun wordText(text: CharSequence, size: Float, color: Int, bold: Boolean = false): TextView =
+        TextView(this).apply {
+            this.text = text
+            textSize = size
+            setTextColor(color)
+            if (bold) setTypeface(null, Typeface.BOLD)
+            setPadding(0, dp(2), 0, dp(2))
+        }
+
+    /** Replace [old] in the box with [new] (a tapped "did you mean"), then check again. */
+    private fun replaceInWordBox(old: String, new: String) {
+        val text = wordQuery.toString()
+        val m = Regex("(?i)(?<![A-Za-z'])" + Regex.escape(old) + "(?![A-Za-z'])").find(text)
+        val replaced = if (m != null) text.replaceRange(m.range, new) else new
+        wordQuery.setLength(0)
+        wordQuery.append(replaced)
+        updateWordQueryView()
+        runWordCheck()
+    }
+
+    private fun renderWordPanel() {
+        val content = wordContent ?: return
+        content.removeAllViews()
+        wordScroll?.scrollTo(0, 0)
+        wordHeaderView?.text = if (wordShowDefinitions) {
+            "DEFINITION  ·  swipe → for spelling"
+        } else {
+            "SPELLING  ·  swipe ← for definition"
+        }
+        val results = wordResults
+        val status = wordStatus
+        when {
+            status != null -> {
+                content.addView(wordText(status, 15f, Color.LTGRAY))
+                return
+            }
+            wordQuery.isBlank() || results == null -> {
+                content.addView(wordText(
+                    "Type a word with the keys, or tap Paste. It's checked online; swipe left for its meaning.",
+                    14f, Color.LTGRAY
+                ))
+                return
+            }
+        }
+        val list = results ?: return
+
+        if (!wordShowDefinitions) {
+            for (info in list) {
+                val mark = if (info.found) "✓  " else "✗  "
+                val line = if (info.found) "$mark${info.word}  — spelled correctly"
+                else "$mark${info.word}  — not a word"
+                content.addView(wordText(line, 16f, if (info.found) goodColor else badColor, bold = true))
+                if (!info.found) {
+                    if (info.suggestions.isEmpty()) {
+                        content.addView(wordText("No close matches found.", 13f, Color.LTGRAY))
+                    } else {
+                        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                        row.addView(wordText("Did you mean:", 13f, Color.LTGRAY))
+                        for (s in info.suggestions) {
+                            row.addView(TextView(this).apply {
+                                text = s
+                                textSize = 15f
+                                setTextColor(Color.WHITE)
+                                setPadding(dp(10), dp(4), dp(10), dp(4))
+                                background = android.graphics.drawable.GradientDrawable().apply {
+                                    setColor(Color.argb(50, 255, 255, 255))
+                                    cornerRadius = dp(12).toFloat()
+                                }
+                                setOnClickListener { replaceInWordBox(info.word, s) }
+                            }, LinearLayout.LayoutParams(
+                                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                            ).apply { marginStart = dp(6) })
+                        }
+                        content.addView(HorizontalScrollView(this).apply {
+                            isHorizontalScrollBarEnabled = false
+                            addView(row)
+                        })
+                    }
+                }
+            }
+        } else {
+            for (info in list) {
+                val title = if (info.phonetic.isNotBlank()) "${info.word}   ${info.phonetic}" else info.word
+                content.addView(wordText(title, 16f, Color.WHITE, bold = true))
+                if (info.meanings.isEmpty()) {
+                    val why = if (info.found) "No definition found." else "Not a word, so there's no definition."
+                    content.addView(wordText(why, 13f, Color.LTGRAY))
+                } else {
+                    for ((pos, def) in info.meanings) {
+                        val styled = SpannableString(if (pos.isNotBlank()) "$pos  $def" else def)
+                        if (pos.isNotBlank()) {
+                            styled.setSpan(
+                                ForegroundColorSpan(Color.LTGRAY), 0, pos.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                            )
+                            styled.setSpan(
+                                android.text.style.StyleSpan(Typeface.ITALIC), 0, pos.length,
+                                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                            )
+                        }
+                        content.addView(wordText(styled, 14f, Color.WHITE))
+                    }
+                }
+            }
+        }
+        val note = if (wordOffline) "Offline — checked against the keyboard's own dictionary."
+        else "From Free Dictionary and Datamuse."
+        content.addView(wordText(note, 10f, Color.GRAY))
+    }
+
     // ---------- Accessory row ----------
 
     private fun handleAccessory(action: AccessoryAction) {
@@ -505,11 +904,15 @@ class MyKeyboardIME : InputMethodService() {
                 if (gifMode) exitGifMode() else enterGifMode()
             }
             AccessoryAction.EMOJI -> {
+                stopGifMode()
+                stopWordMode()
                 page = if (page == KeyboardPage.EMOJI) KeyboardPage.LETTERS else KeyboardPage.EMOJI
                 currentWord.clear()
                 populateKeyboard()
             }
             AccessoryAction.CLIPBOARD -> {
+                stopGifMode()
+                stopWordMode()
                 page = if (page == KeyboardPage.CLIPBOARD) KeyboardPage.LETTERS else KeyboardPage.CLIPBOARD
                 currentWord.clear()
                 populateKeyboard()
@@ -692,10 +1095,13 @@ class MyKeyboardIME : InputMethodService() {
             KeyAction.BACKSPACE -> {
                 state.backspace = true
                 handleTap(target.config)
+                // That press may have closed the GIF search or word check (which rebuilds the
+                // keyboard and drops this touch); don't keep deleting in the app after it.
+                if (touches.get(id) !== state) return
                 startRepeating(400L, 45L) { handleTap(target.config) }
                 repeatOwner = id
             }
-            KeyAction.SPACE -> scheduleSpaceHold(id)
+            KeyAction.SPACE -> if (spaceBarMovesCursor && !gifMode && !wordMode) scheduleSpaceHold(id)
             KeyAction.CURSOR -> state.cursorPad = true
             else -> {}
         }
@@ -724,6 +1130,8 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
         if (key.config.action != KeyAction.SPACE || state.spaceGesture) return
+        // While searching GIFs or checking a word the space bar is just a space.
+        if (gifMode || wordMode) return
         val dx = x - state.downX
         val dy = y - state.downY
         // A flick up on the space bar accepts the dimmed prediction in the suggestion bar.
@@ -738,13 +1146,22 @@ class MyKeyboardIME : InputMethodService() {
             }
             return
         }
-        // A flick along the space bar moves the cursor exactly one character.
         if (abs(dx) >= dp(24) && abs(dx) > abs(dy)) {
-            state.slideDir = if (dx > 0) 1 else -1
-            state.spaceGesture = true
-            moveCursor(state.slideDir)
-            // Keep holding after the flick and it keeps going, getting faster.
-            scheduleSpaceHold(id)
+            if (dx > 0) {
+                // A flick right puts a space just after the cursor; the cursor stays put.
+                state.spaceGesture = true
+                state.consumed = true
+                holdRunnable?.let { uiHandler.removeCallbacks(it) }
+                holdRunnable = null
+                insertSpaceAhead()
+            } else if (spaceBarMovesCursor) {
+                // Original layout (no cursor key): a flick left moves the cursor one
+                // character, and holding on keeps it going, getting faster.
+                state.slideDir = -1
+                state.spaceGesture = true
+                moveCursor(-1)
+                scheduleSpaceHold(id)
+            }
         }
     }
 
@@ -836,6 +1253,18 @@ class MyKeyboardIME : InputMethodService() {
         }
         repeatRunnable = r
         uiHandler.post(r)
+    }
+
+    /** Type a space on the far side of the cursor, leaving the cursor where it is. */
+    private fun insertSpaceAhead() {
+        val ic = currentInputConnection ?: return
+        // A new cursor position of 0 means "at the start of what was just typed".
+        ic.commitText(" ", 0)
+        pendingCorrection = null
+        clearAutoSpace()
+        spaceAfterWord = false
+        lastWasSpace = false
+        updatePrediction()
     }
 
     private fun moveCursor(dir: Int) =
@@ -960,6 +1389,7 @@ class MyKeyboardIME : InputMethodService() {
         // The cursor key does its work while being dragged; a plain tap types nothing.
         if (config.action == KeyAction.CURSOR) return
         if (gifMode && handleGifKey(config)) return
+        if (wordMode && handleWordKey(config)) return
         val ic = currentInputConnection ?: return
 
         if (config.action == KeyAction.CHAR && config.commitOverride == null &&
@@ -1145,6 +1575,13 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun commitDirect(text: String) {
+        if (wordMode) {
+            if (text.length == 1) {
+                wordQuery.append(text)
+                scheduleWordCheck()
+            }
+            return
+        }
         if (gifMode) {
             if (text.length == 1) {
                 gifQuery.append(text.lowercase())
@@ -1340,7 +1777,7 @@ class MyKeyboardIME : InputMethodService() {
      * keeps it as typed and adds it to your own words.
      */
     private fun updateSuggestions() {
-        if (gifMode) return
+        if (gifMode || wordMode) return
         val icons = iconStrip ?: return
         val strip = suggestionStrip ?: return
         val typed = currentWord.toString()
@@ -1435,7 +1872,7 @@ class MyKeyboardIME : InputMethodService() {
     /** Keeps the touch model's idea of the next letter current. Cheap, so it runs on every keystroke. */
     /** Whether the word model should steer touches at all right now. */
     private fun priorActive(): Boolean =
-        predictionStrength > 0 && !gifMode && autocorrectAllowed && page == KeyboardPage.LETTERS
+        predictionStrength > 0 && !gifMode && !wordMode && autocorrectAllowed && page == KeyboardPage.LETTERS
 
     private fun refreshLetterPrior() {
         if (!priorActive()) {
@@ -1469,7 +1906,7 @@ class MyKeyboardIME : InputMethodService() {
 
     /** Ask the app once whether the cursor sits at the start of a sentence. */
     private fun refreshAutoCap() {
-        if (!autoCapAllowed || gifMode) return
+        if (!autoCapAllowed || gifMode || wordMode) return
         val ic = currentInputConnection ?: return
         val atSentenceStart = ic.getCursorCapsMode(InputType.TYPE_TEXT_FLAG_CAP_SENTENCES) != 0
         if (atSentenceStart) {
@@ -1501,6 +1938,7 @@ class MyKeyboardIME : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         exitGifMode()
+        exitWordMode()
         currentWord.clear()
         pendingCorrection = null
         autocorrectSuppressedWord = null

@@ -7,12 +7,14 @@ import android.graphics.RectF
 import android.graphics.drawable.GradientDrawable
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.text.TextUtils
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlin.math.sin
@@ -197,6 +199,8 @@ object KeyboardBuilder {
         onFlick: (KeyConfig, String) -> Unit,
         onAccessory: (AccessoryAction) -> Unit,
         onSuggestion: (String) -> Unit = {},
+        /** A flick up on the suggestion area (opens the word checker). */
+        onStripFlickUp: () -> Unit = {},
         splitStyle: Boolean = KeyboardPrefs.getSplitLayout(context)
     ): BuiltKeyboard {
         val dm = context.resources.displayMetrics
@@ -253,6 +257,39 @@ object KeyboardBuilder {
         }
 
         val root = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
+
+        /**
+         * A flick up on [v] calls [onStripFlickUp] instead of tapping it. Checked
+         * when the finger lifts, so the keyboard isn't rebuilt mid-gesture.
+         */
+        val flickUpPx = dp(22).toFloat()
+        fun flickUpAware(v: View) {
+            var downX = 0f
+            var downY = 0f
+            v.setOnTouchListener { view, e ->
+                when (e.actionMasked) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = e.rawX
+                        downY = e.rawY
+                        // Plain (non-button) parts must claim the touch to see the rest of it.
+                        !view.isClickable
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        val dx = e.rawX - downX
+                        val dy = e.rawY - downY
+                        if (dy <= -flickUpPx && abs(dy) > abs(dx)) {
+                            view.isPressed = false
+                            view.cancelLongPress()
+                            view.post { onStripFlickUp() }
+                            true
+                        } else {
+                            !view.isClickable
+                        }
+                    }
+                    else -> !view.isClickable
+                }
+            }
+        }
 
         // ----- Hotkeys and suggestions (shared by every style; placed below) -----
 
@@ -322,6 +359,13 @@ object KeyboardBuilder {
             else LinearLayout.LayoutParams(0, dp(36), 1f)
             suggestionViews.add(tv)
             suggestionStrip.addView(tv, lp)
+            flickUpAware(tv)
+        }
+        flickUpAware(suggestionStrip)
+        if (!splitStyle) {
+            // On the original layout the hotkeys sit where the suggestions go when not typing.
+            flickUpAware(iconStrip)
+            for (icon in icons) flickUpAware(icon)
         }
 
         val stripHost = FrameLayout(context)
@@ -397,6 +441,8 @@ object KeyboardBuilder {
                 LinearLayout.LayoutParams(dp(60), dp(40)).apply { marginStart = dp(6) }
             )
             inner.addView(second, LinearLayout.LayoutParams(matchParent, wrapContent).apply { topMargin = dp(4) })
+            // A search box laid over the strip leaves the enter key showing.
+            stripEndInset = dp(66)
             stripHost.addView(inner, FrameLayout.LayoutParams(matchParent, wrapContent))
             top.addView(stripHost, LinearLayout.LayoutParams(matchParent, wrapContent))
             root.addView(top, LinearLayout.LayoutParams(matchParent, wrapContent))
