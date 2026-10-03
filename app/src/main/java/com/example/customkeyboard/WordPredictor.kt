@@ -345,12 +345,29 @@ object WordPredictor {
             emptyList() // A missing file just means fewer words.
         }
 
+    /**
+     * Words taken out of every list (assets/removed_words.txt): one per line,
+     * "#" starts a comment. Mostly junk from the big web-text list ("thst",
+     * "teh") that would otherwise count as real words, be suggested, and
+     * steer the touch model. A word the person adds themselves still works.
+     */
+    private fun loadRemoved(context: Context): Set<String> {
+        val out = HashSet<String>()
+        for (line in readList(context, "removed_words.txt")) {
+            val w = normalize(line.substringBefore('#').trim())
+            if (w.isNotEmpty()) out.add(w)
+        }
+        return out
+    }
+
     private fun loadAssetWords(context: Context) {
+        val removed = loadRemoved(context)
+        val builtIn = WORDS.filter { it !in removed }
         // wordlist.txt: word -> frequency (uses per word of text), or null if the line had no Zipf value.
         val listed = LinkedHashMap<String, Double?>()
         for (line in readList(context, "wordlist.txt")) {
             val w = normalize(line.substringBefore('\t').trim())
-            if (!isLearnable(w) || listed.containsKey(w)) continue
+            if (!isLearnable(w) || w in removed || listed.containsKey(w)) continue
             val zipf = line.substringAfter('\t', "").trim().toDoubleOrNull()
             listed[w] = zipf?.let { 10.0.pow(it - 9.0) }
         }
@@ -359,14 +376,14 @@ object WordPredictor {
         for (name in listOf("wordlist2.txt", "wordlist3.txt", "wordlist4.txt")) {
             for (line in readList(context, name)) {
                 val w = normalize(line.substringBefore('\t').trim())
-                if (isLearnable(w)) extras.add(w)
+                if (isLearnable(w) && w !in removed) extras.add(w)
             }
         }
 
         val rarest = listed.values.filterNotNull().minOrNull()
         if (rarest == null) {
             // No frequencies: rank everything after the built-in words, as before.
-            val merged = LinkedHashSet<String>(WORDS)
+            val merged = LinkedHashSet<String>(builtIn)
             merged.addAll(listed.keys)
             merged.addAll(extras)
             staticWords = merged.toList()
@@ -374,14 +391,14 @@ object WordPredictor {
         } else {
             // Real frequencies: wordlist.txt's order wins; built-in and extra words it
             // lacks (and lines missing a value) get the rarest listed frequency.
-            val freq = LinkedHashMap<String, Double>(listed.size + WORDS.size + extras.size)
+            val freq = LinkedHashMap<String, Double>(listed.size + builtIn.size + extras.size)
             for ((w, f) in listed) freq[w] = f ?: rarest
-            for (w in WORDS) if (!freq.containsKey(w)) freq[w] = rarest
+            for (w in builtIn) if (!freq.containsKey(w)) freq[w] = rarest
             for (w in extras) if (!freq.containsKey(w)) freq[w] = rarest
             val sum = freq.values.sum()
             for (e in freq.entries) e.setValue(e.value / sum)
             freqScale = sum
-            val handListed = HashSet<String>(WORDS).also { it.addAll(extras) }
+            val handListed = HashSet<String>(builtIn).also { it.addAll(extras) }
             val rare = HashMap<String, Float>()
             for ((w, f) in listed) {
                 if (f == null || w in handListed) continue
@@ -396,7 +413,7 @@ object WordPredictor {
         }
         rank = buildRank(staticWords)
         harmonic = harmonicSum(staticWords.size)
-        curatedWords = HashSet<String>(WORDS).also { it.addAll(extras) }
+        curatedWords = HashSet<String>(builtIn).also { it.addAll(extras) }
     }
 
     // ---------- text hygiene ----------
