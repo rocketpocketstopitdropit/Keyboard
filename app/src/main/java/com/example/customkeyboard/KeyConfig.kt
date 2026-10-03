@@ -22,6 +22,7 @@ data class KeyConfig(
 
 enum class KeyAction {
     CHAR, SHIFT, BACKSPACE, ENTER, SPACE, SYMBOLS, SYMBOLS_ALT, LETTERS,
+    CURSOR, // Split Thumb only: drag on it to move the cursor
     SPACER // invisible, non-tappable filler — not a real key
 }
 
@@ -36,6 +37,9 @@ object KeyboardLayout {
     val NOTCH_KEY = KeyConfig("⏎", weight = 1.5f, action = KeyAction.ENTER)
 
     private val BACKSPACE = KeyConfig("⌫", weight = 1.5f, action = KeyAction.BACKSPACE)
+
+    /** Split Thumb's cursor key, beside the space bar. Not editable, so it has no address. */
+    val CURSOR_KEY = KeyConfig("◂ ▸", action = KeyAction.CURSOR)
 
     /** The built-in key at this position. row = -1 is the notch key. */
     fun defaultFor(row: Int, col: Int): KeyConfig = if (row < 0) NOTCH_KEY else ROWS[row][col]

@@ -16,6 +16,7 @@ object KeyboardPrefs {
     private const val AUTO_CAPITALIZE = "auto_capitalize"
     private const val DOUBLE_SPACE_PERIOD = "double_space_period"
     private const val KLIPY_KEY = "klipy_api_key"
+    private const val SPLIT_LAYOUT = "split_thumb_layout"
 
     const val DEFAULT_HEIGHT = 52
     const val DEFAULT_KEY_WIDTH = 100
@@ -81,6 +82,14 @@ object KeyboardPrefs {
         prefs(context).getBoolean(DOUBLE_SPACE_PERIOD, true)
     fun setDoubleSpacePeriod(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(DOUBLE_SPACE_PERIOD, value).apply()
+
+    // Split Thumb layout (split halves on a wide screen, compact on a narrow
+    // one) instead of the original layout. The keys and their order are the
+    // same in both, so customised keys carry over either way.
+    fun getSplitLayout(context: Context): Boolean =
+        prefs(context).getBoolean(SPLIT_LAYOUT, true)
+    fun setSplitLayout(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(SPLIT_LAYOUT, value).apply()
 
     // API key for GIF search (Klipy). Empty until the person adds one.
     fun getKlipyKey(context: Context): String =

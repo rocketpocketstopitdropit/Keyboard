@@ -54,6 +54,17 @@ class KeyEditorActivity : Activity() {
             setPadding(0, dp(8), 0, 0)
         }
         controls.addView(
+            toggleRow("Split Thumb layout", KeyboardPrefs.getSplitLayout(this)) {
+                KeyboardPrefs.setSplitLayout(this, it); rebuildPreview()
+            }
+        )
+        controls.addView(TextView(this).apply {
+            text = "Split halves on a wide screen, a compact version on a narrow one. Turn it off for the " +
+                    "original layout. Your customised keys work in both."
+            textSize = 12f
+            alpha = 0.7f
+        })
+        controls.addView(
             sliderRow("Key height", 24, 72, KeyboardPrefs.getKeyHeight(this), "dp") {
                 KeyboardPrefs.setKeyHeight(this, it); rebuildPreview()
             }

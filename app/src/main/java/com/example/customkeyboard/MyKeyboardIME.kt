@@ -69,6 +69,9 @@ class MyKeyboardIME : InputMethodService() {
     private var iconStrip: View? = null
     private var suggestionStrip: View? = null
     private var suggestionViews: List<TextView> = emptyList()
+    /** Split Thumb: suggestions have their own spot, so the hotkeys always stay visible. */
+    private var suggestionsSeparate = false
+    private var stripEndInset = 0
 
     private var predictedKeyView: KeyView? = null
 
@@ -205,6 +208,8 @@ class MyKeyboardIME : InputMethodService() {
         iconStrip = built.iconStrip
         suggestionStrip = built.suggestionStrip
         suggestionViews = built.suggestionViews
+        suggestionsSeparate = built.separateSuggestions
+        stripEndInset = built.stripEndInset
         if (gifMode) attachGifPanel(built)
         allKeys.clear()
         allKeys.addAll(built.keys)
@@ -264,7 +269,9 @@ class MyKeyboardIME : InputMethodService() {
         val queryRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(4), dp(2), 0)
+            setPadding(dp(4), dp(4), dp(2) + stripEndInset, 0)
+            // Split Thumb's strip has no background of its own under the box.
+            setBackgroundColor(getColor(R.color.keyboard_background))
         }
         queryRow.addView(TextView(this).apply {
             text = "\u2715"
@@ -610,6 +617,10 @@ class MyKeyboardIME : InputMethodService() {
         var backspace = false
         /** The gesture already did its job (a flick up accepted a suggestion). */
         var consumed = false
+        /** Split Thumb's cursor key: where the finger was when the cursor last moved. */
+        var cursorPad = false
+        var anchorX = downX
+        var anchorY = downY
     }
 
     private class KeyRect(val key: KeyView, val rect: Rect)
@@ -685,8 +696,22 @@ class MyKeyboardIME : InputMethodService() {
                 repeatOwner = id
             }
             KeyAction.SPACE -> scheduleSpaceHold(id)
+            KeyAction.CURSOR -> state.cursorPad = true
             else -> {}
         }
+    }
+
+    /**
+     * Dragging on the cursor key moves the cursor: one character for every
+     * short step sideways, one line for every longer step up or down.
+     */
+    private fun dragCursor(state: TouchState, x: Float, y: Float) {
+        val stepX = dp(14).toFloat()
+        val stepY = dp(30).toFloat()
+        while (x - state.anchorX >= stepX) { moveCursor(1); state.anchorX += stepX }
+        while (state.anchorX - x >= stepX) { moveCursor(-1); state.anchorX -= stepX }
+        while (y - state.anchorY >= stepY) { moveCursorLine(1); state.anchorY += stepY }
+        while (state.anchorY - y >= stepY) { moveCursorLine(-1); state.anchorY -= stepY }
     }
 
     private fun pointerMove(id: Int, x: Float, y: Float) {
@@ -694,6 +719,10 @@ class MyKeyboardIME : InputMethodService() {
         state.lastX = x
         state.lastY = y
         val key = state.key ?: return
+        if (state.cursorPad) {
+            dragCursor(state, x, y)
+            return
+        }
         if (key.config.action != KeyAction.SPACE || state.spaceGesture) return
         val dx = x - state.downX
         val dy = y - state.downY
@@ -731,7 +760,7 @@ class MyKeyboardIME : InputMethodService() {
         val key = state.key ?: return
         // A finger that landed earlier but is still down gets typed first, so
         // letters always come out in the order they were pressed ("an", not "na").
-        if (!state.backspace && !state.consumed && !state.spaceGesture) {
+        if (!state.backspace && !state.consumed && !state.spaceGesture && !state.cursorPad) {
             for (t in heldLetterTouches()) {
                 if (t.seq >= state.seq) break
                 t.consumed = true
@@ -741,7 +770,7 @@ class MyKeyboardIME : InputMethodService() {
         when {
             state.backspace -> key.setPressedVisual(false)
             state.consumed -> key.setPressedVisual(false)
-            state.spaceGesture -> {
+            state.spaceGesture || state.cursorPad -> {
                 key.setPressedVisual(false)
                 refreshAutoCap()
             }
@@ -809,9 +838,15 @@ class MyKeyboardIME : InputMethodService() {
         uiHandler.post(r)
     }
 
-    private fun moveCursor(dir: Int) {
+    private fun moveCursor(dir: Int) =
+        sendCursorKey(if (dir > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT)
+
+    /** Up or down one line. */
+    private fun moveCursorLine(dir: Int) =
+        sendCursorKey(if (dir > 0) KeyEvent.KEYCODE_DPAD_DOWN else KeyEvent.KEYCODE_DPAD_UP)
+
+    private fun sendCursorKey(keyCode: Int) {
         val ic = currentInputConnection ?: return
-        val keyCode = if (dir > 0) KeyEvent.KEYCODE_DPAD_RIGHT else KeyEvent.KEYCODE_DPAD_LEFT
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
         currentWord.clear()
@@ -922,6 +957,8 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun handleTap(config: KeyConfig) {
+        // The cursor key does its work while being dragged; a plain tap types nothing.
+        if (config.action == KeyAction.CURSOR) return
         if (gifMode && handleGifKey(config)) return
         val ic = currentInputConnection ?: return
 
@@ -1102,7 +1139,7 @@ class MyKeyboardIME : InputMethodService() {
                     refreshLabels()
                 }
             }
-            KeyAction.BACKSPACE, KeyAction.SPACER -> {}
+            KeyAction.BACKSPACE, KeyAction.SPACER, KeyAction.CURSOR -> {}
         }
         updatePrediction()
     }
@@ -1310,8 +1347,13 @@ class MyKeyboardIME : InputMethodService() {
 
         if (typed.isEmpty() || !autocorrectAllowed || suggestionViews.size < 3) {
             acceptWord = null
-            strip.visibility = View.GONE
-            icons.visibility = View.VISIBLE
+            if (suggestionsSeparate) {
+                // The suggestion spot stays where it is, just empty.
+                for (tv in suggestionViews) tv.text = ""
+            } else {
+                strip.visibility = View.GONE
+                icons.visibility = View.VISIBLE
+            }
             return
         }
 
@@ -1350,7 +1392,7 @@ class MyKeyboardIME : InputMethodService() {
             tv.text = slots[i] ?: ""
             tv.setTypeface(null, if (i == 1) Typeface.BOLD else Typeface.NORMAL)
         }
-        icons.visibility = View.GONE
+        if (!suggestionsSeparate) icons.visibility = View.GONE
         strip.visibility = View.VISIBLE
     }
 

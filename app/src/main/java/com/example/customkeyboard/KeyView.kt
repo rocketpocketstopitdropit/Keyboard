@@ -29,7 +29,14 @@ class KeyView(
     private val onTap: (KeyConfig) -> Unit,
     private val onFlick: (KeyConfig, String) -> Unit,
     private val showHints: Boolean = true,
-    private val showPredictedHighlight: Boolean = true
+    private val showPredictedHighlight: Boolean = true,
+    /** Colours for the Split Thumb look; null keeps the original colours. */
+    private val palette: KeyPalette? = null,
+    /** Fill for this key instead of the palette's (the accent-coloured enter key). */
+    private val fillColor: Int? = null,
+    private val labelColor: Int? = null,
+    /** A small bar under the label (the home keys F and J), or null for none. */
+    private val bumpColor: Int? = null
 ) : FrameLayout(context) {
 
     companion object {
@@ -82,6 +89,14 @@ class KeyView(
             mid = Color.parseColor(config.colorHex)
             light = blend(mid, Color.WHITE, 0.35f)
             dark = blend(mid, Color.BLACK, 0.45f)
+        } else if (fillColor != null) {
+            mid = fillColor
+            light = blend(mid, Color.WHITE, 0.3f)
+            dark = blend(mid, Color.BLACK, 0.35f)
+        } else if (palette != null) {
+            mid = if (config.action != KeyAction.CHAR) palette.special else palette.key
+            light = palette.light
+            dark = palette.dark
         } else {
             val baseColorRes = if (config.action != KeyAction.CHAR) R.color.key_background_special
             else R.color.key_background
@@ -118,12 +133,24 @@ class KeyView(
 
         centerLabel = TextView(context).apply {
             text = config.label
-            setTextColor(Color.WHITE)
-            textSize = 18f
+            setTextColor(labelColor ?: Color.WHITE)
+            textSize = if (config.action == KeyAction.CURSOR) 14f else 18f
             gravity = Gravity.CENTER
             layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT)
         }
         addView(centerLabel)
+
+        if (bumpColor != null) {
+            addView(View(context).apply {
+                background = GradientDrawable().apply {
+                    setColor(bumpColor)
+                    cornerRadius = dp(1)
+                }
+                layoutParams = LayoutParams(dp(10).toInt(), dp(2).toInt(), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+                    bottomMargin = dp(7).toInt()
+                }
+            })
+        }
 
         if (showHints) {
             addCornerHint(config.topLeft, Gravity.TOP or Gravity.START)
@@ -169,6 +196,9 @@ class KeyView(
         }
         background = if (isPressedIn) pressedDrawable else restDrawable
     }
+
+    /** How far the predicted key's touch area reaches past its edges, in pixels. */
+    val predictedExpandPx: Int get() = expandPx
 
     /** Never widened — this key's true on-screen bounds. */
     fun rawLocalRect(): Rect = Rect(left, top, right, bottom)
