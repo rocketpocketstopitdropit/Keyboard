@@ -151,6 +151,51 @@ class UserLanguageModel {
         eventsSinceSave++
     }
 
+    // ---------- export / import ----------
+
+    /** A copy of how often each word has been used. */
+    fun wordCounts(): Map<String, Float> = HashMap(unigrams)
+
+    /** A copy of which word followed which, and how often. */
+    fun pairCounts(): Map<String, Map<String, Float>> =
+        bigrams.mapValues { HashMap(it.value) }
+
+    /** Replace the added words with [words] (already checked by the caller). */
+    fun replaceAddedWords(words: Collection<String>) {
+        addedWords.clear()
+        addedWords.addAll(words)
+        persistAdded()
+        vocabularyVersion++
+        dataVersion++
+    }
+
+    /** Replace everything learned with these counts, and save right away. */
+    fun replaceCounts(words: Map<String, Float>?, pairs: Map<String, Map<String, Float>>?) {
+        if (words != null) {
+            unigrams.clear()
+            unigrams.putAll(words)
+            unigramTotal = unigrams.values.sum()
+        }
+        if (pairs != null) {
+            bigrams.clear()
+            for ((p, row) in pairs) if (row.isNotEmpty()) bigrams[p] = HashMap(row)
+        }
+        dataVersion++
+        save()
+    }
+
+    /** Removes a word everywhere: from the added words and from everything learned. */
+    fun forget(words: Set<String>) {
+        var changed = false
+        for (w in words) if (addedWords.remove(w)) changed = true
+        if (changed) {
+            persistAdded()
+            vocabularyVersion++
+        }
+        retainWords { it !in words }
+        save()
+    }
+
     /** Drop anything learned about words that [keep] rejects (earlier versions stored non-words). */
     fun retainWords(keep: (String) -> Boolean) {
         var changed = false

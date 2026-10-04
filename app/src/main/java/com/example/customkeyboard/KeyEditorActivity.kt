@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Color
 import android.os.Bundle
 import android.text.InputType
@@ -191,6 +192,34 @@ class KeyEditorActivity : Activity() {
                 Toast.makeText(this@KeyEditorActivity, "Learned words cleared", Toast.LENGTH_SHORT).show()
             }
         })
+        controls.addView(Button(this).apply {
+            text = "Export my words to a file"
+            setOnClickListener {
+                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "text/plain"
+                    putExtra(Intent.EXTRA_TITLE, "keyboard-words.txt")
+                }
+                startActivityForResult(intent, REQUEST_EXPORT_WORDS)
+            }
+        })
+        controls.addView(Button(this).apply {
+            text = "Import words from a file"
+            setOnClickListener {
+                val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "text/*"
+                }
+                startActivityForResult(intent, REQUEST_IMPORT_WORDS)
+            }
+        })
+        controls.addView(TextView(this).apply {
+            text = "The file lists your added words and everything learned from your typing. " +
+                "Edit it in any text app; importing replaces what's on the phone with what's in the file."
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, 0, 0, dp(4))
+        })
         controls.addView(TextView(this).apply {
             text = "Backup"
             textSize = 14f
@@ -269,6 +298,53 @@ class KeyEditorActivity : Activity() {
 
         setContentView(screen)
         rebuildPreview()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null) return
+        when (requestCode) {
+            REQUEST_EXPORT_WORDS -> try {
+                val text = WordListFile.export()
+                contentResolver.openOutputStream(uri, "wt")?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+                    ?: throw Exception("couldn't open the file")
+                Toast.makeText(this, "Words exported.", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(this, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+            REQUEST_IMPORT_WORDS -> {
+                val result = try {
+                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                        ?: throw Exception("couldn't open the file")
+                    if (bytes.size > 5_000_000) throw Exception("that file is too big")
+                    WordListFile.import(String(bytes, Charsets.UTF_8))
+                } catch (e: Exception) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Import failed")
+                        .setMessage(e.message ?: "That file couldn't be read.")
+                        .setPositiveButton("OK", null)
+                        .show()
+                    return
+                }
+                val lines = ArrayList<String>()
+                result.added?.let { lines.add("Added words: $it") }
+                result.words?.let { lines.add("Learned words: $it") }
+                result.pairs?.let { lines.add("Word pairs: $it") }
+                if (result.skipped.isNotEmpty()) {
+                    lines.add("")
+                    lines.add("Skipped ${result.skipped.size} line(s):")
+                    lines.addAll(result.skipped.take(15))
+                    if (result.skipped.size > 15) lines.add("…and ${result.skipped.size - 15} more")
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("Words imported")
+                    .setMessage(lines.joinToString("\n"))
+                    .setPositiveButton("OK") { _, _ -> recreate() }
+                    .setOnCancelListener { recreate() }
+                    .show()
+            }
+        }
     }
 
     private fun rebuildPreview() {
@@ -425,5 +501,9 @@ class KeyEditorActivity : Activity() {
         TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP, value.toFloat(), resources.displayMetrics
         ).toInt()
-}
 
+    companion object {
+        private const val REQUEST_EXPORT_WORDS = 41
+        private const val REQUEST_IMPORT_WORDS = 42
+    }
+}

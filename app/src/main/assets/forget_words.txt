@@ -1,0 +1,7 @@
+# Words to wipe from your own data on the phone (added words and everything
+# the keyboard has learned) the next time the updated app starts.
+# Each word is wiped once, so if you add it again later it stays.
+# One word per line; anything after # is a comment.
+stfixture
+dnot
+instsnces

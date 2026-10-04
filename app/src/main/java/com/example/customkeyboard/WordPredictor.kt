@@ -285,6 +285,7 @@ object WordPredictor {
         appContext = app
         loadAssetWords(app)
         user.load(app)
+        applyForgetList(app)
         // Earlier versions also remembered words that aren't real words; forget those.
         user.retainWords { it == START || isKnown(it) }
         index = null
@@ -545,6 +546,50 @@ object WordPredictor {
     fun addedWords(): List<String> = user.addedWordList()
 
     fun clearAddedWords() = user.clearAddedWords()
+
+    /**
+     * assets/forget_words.txt: words to wipe from the person's own data (added
+     * words and everything learned) after an update. Each word is wiped once,
+     * so adding it again later on the phone sticks.
+     */
+    private fun applyForgetList(context: Context) {
+        val prefs = context.getSharedPreferences("word_cleanup", Context.MODE_PRIVATE)
+        val done = prefs.getStringSet("forgotten", null) ?: emptySet()
+        val todo = HashSet<String>()
+        for (line in readList(context, "forget_words.txt")) {
+            val w = normalize(line.substringBefore('#').trim())
+            if (w.isNotEmpty() && w !in done) todo.add(w)
+        }
+        if (todo.isEmpty()) return
+        user.forget(todo)
+        prefs.edit().putStringSet("forgotten", HashSet(done + todo)).apply()
+    }
+
+    // ---------- export / import of the person's data (see WordListFile) ----------
+
+    /** A plain word: letters with inner apostrophes, nothing odd. */
+    fun isPlainWord(word: String): Boolean = isLearnable(normalize(word))
+
+    /** Could be one of the person's added words (a plain word the dictionary doesn't already trust). */
+    fun canBeAdded(word: String): Boolean {
+        val w = normalize(word)
+        return isLearnable(w) && !isTrusted(w)
+    }
+
+    fun learnedWordCounts(): Map<String, Float> = user.wordCounts()
+
+    fun learnedPairCounts(): Map<String, Map<String, Float>> = user.pairCounts()
+
+    /** Swap in imported data. A null part is left as it was. */
+    fun replaceUserData(
+        added: Collection<String>?,
+        words: Map<String, Float>?,
+        pairs: Map<String, Map<String, Float>>?
+    ) {
+        if (added != null) user.replaceAddedWords(added)
+        user.replaceCounts(words, pairs)
+        index = null
+    }
 
     /** Re-reads the added words from storage, e.g. after restoring a backup. */
     fun reloadUserWords() = user.reloadAddedWords()
