@@ -314,9 +314,18 @@ object KeyboardBuilder {
             accessoryIcon("🎤", AccessoryAction.MIC)
         )
         val micButton = icons.last()
+        // Wide Split Thumb: fixed-size hotkeys on the left, the Enter key on the right,
+        // and the suggestions centred in whatever is left between them.
+        val wideIconDp = 44
+        val wideEnterDp = 100
+        val wideSlotDp = run {
+            val between = context.resources.configuration.screenWidthDp -
+                    16 - (wideEnterDp + 8) - wideIconDp * icons.size - 16
+            ((between - 2) / 3).coerceIn(60, 132)
+        }
         for (icon in icons) {
             // On a wide Split Thumb keyboard the hotkeys keep to the left; otherwise they share the row evenly.
-            val lp = if (splitStyle && wide) LinearLayout.LayoutParams(dp(48), dp(40))
+            val lp = if (splitStyle && wide) LinearLayout.LayoutParams(dp(wideIconDp), dp(40))
             else LinearLayout.LayoutParams(0, dp(36), 1f)
             iconStrip.addView(icon, lp)
         }
@@ -355,7 +364,7 @@ object KeyboardBuilder {
                     if (word.isNotEmpty()) onSuggestion(word)
                 }
             }
-            val lp = if (splitStyle && wide) LinearLayout.LayoutParams(dp(132), dp(40))
+            val lp = if (splitStyle && wide) LinearLayout.LayoutParams(dp(wideSlotDp), dp(40))
             else LinearLayout.LayoutParams(0, dp(36), 1f)
             suggestionViews.add(tv)
             suggestionStrip.addView(tv, lp)
@@ -410,12 +419,18 @@ object KeyboardBuilder {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            line.addView(iconStrip, LinearLayout.LayoutParams(0, stripHeight, 1f))
+            val enterWidth = dp(wideEnterDp)
+            // The hotkeys take exactly the room they need, so the last one (the mic) is never cut off.
+            line.addView(iconStrip, LinearLayout.LayoutParams(wrapContent, stripHeight))
+            line.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
             line.addView(suggestionStrip, LinearLayout.LayoutParams(wrapContent, dp(40)))
             line.addView(View(context), LinearLayout.LayoutParams(0, 1, 1f))
-            stripHost.addView(line, FrameLayout.LayoutParams(matchParent, stripHeight))
+            // Stop short of the Enter key instead of running underneath it.
+            stripHost.addView(
+                line,
+                FrameLayout.LayoutParams(matchParent, stripHeight).apply { marginEnd = enterWidth + dp(8) }
+            )
             top.addView(stripHost, FrameLayout.LayoutParams(matchParent, stripHeight))
-            val enterWidth = dp(100)
             top.addView(
                 makeKey(enterConfig, KeyAddress(-1, 0)),
                 FrameLayout.LayoutParams(enterWidth, stripHeight, Gravity.END or Gravity.CENTER_VERTICAL)
