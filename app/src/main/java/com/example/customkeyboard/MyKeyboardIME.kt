@@ -92,6 +92,9 @@ class MyKeyboardIME : InputMethodService() {
     private var lastWasSpace = false
     private var lastSpaceTime = 0L
     private var lastCharWordish = false
+    // Letters typed straight after a number ("13th", "2nd", "5km") are never autocorrected.
+    private var lastCharDigit = false
+    private var wordAfterDigit = false
     private var sentenceEndPending = false
     private var shiftIsAuto = false
     /** The person switched off an automatic capital; don't force one on the next letter. */
@@ -1509,7 +1512,9 @@ class MyKeyboardIME : InputMethodService() {
                 // alone now, and remember it strongly so it isn't "fixed" again.
                 val rejected = typed.isNotEmpty() && typed == suppressed
                 val endsWithApostrophe = typed.isNotEmpty() && isApostrophe(typed.last())
-                val correction = if (typed.isEmpty() || rejected || endsWithApostrophe || !autocorrectAllowed) {
+                val correction = if (typed.isEmpty() || rejected || endsWithApostrophe || !autocorrectAllowed ||
+                    wordAfterDigit
+                ) {
                     null
                 } else {
                     correctionFor(typed)?.let { matchCase(typed, it) }
@@ -1554,6 +1559,7 @@ class MyKeyboardIME : InputMethodService() {
                 // An apostrophe inside a word ("don't") belongs to the word.
                 val isInnerApostrophe = text.length == 1 && isApostrophe(text[0]) && currentWord.isNotEmpty()
                 if (isLetter || isInnerApostrophe) {
+                    if (isLetter && currentWord.isEmpty()) wordAfterDigit = lastCharWordish && lastCharDigit
                     currentWord.append(text)
                 } else {
                     finishWord(currentWord.toString(), 1f)
@@ -1562,6 +1568,7 @@ class MyKeyboardIME : InputMethodService() {
                     }
                 }
                 lastCharWordish = text.length == 1 && text[0].isLetterOrDigit()
+                lastCharDigit = text.length == 1 && text[0].isDigit()
                 sentenceEndPending = text.length == 1 && (text[0] == '.' || text[0] == '!' || text[0] == '?')
                 if (shiftState == ShiftState.ONCE) {
                     shiftState = ShiftState.OFF
@@ -1670,7 +1677,9 @@ class MyKeyboardIME : InputMethodService() {
         val typed = currentWord.toString()
         val suppressed = autocorrectSuppressedWord
         autocorrectSuppressedWord = null
-        if (typed.isEmpty() || typed == suppressed || isApostrophe(typed.last()) || !autocorrectAllowed) return null
+        if (typed.isEmpty() || typed == suppressed || isApostrophe(typed.last()) || !autocorrectAllowed ||
+            wordAfterDigit
+        ) return null
         val correction = correctionFor(typed)?.let { matchCase(typed, it) } ?: return null
         ic.deleteSurroundingText(typed.length, 0)
         ic.commitText(correction, 1)
@@ -1712,6 +1721,7 @@ class MyKeyboardIME : InputMethodService() {
             previousWord = WordPredictor.pushContext(previousWord, bare)
         }
         currentWord.clear()
+        wordAfterDigit = false
     }
 
     /**
