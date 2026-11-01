@@ -153,6 +153,13 @@ class UserLanguageModel {
     fun unigramTotal(): Float = unigramTotal
     fun bigramRow(previous: String): Map<String, Float>? = bigrams[previous]
 
+    /** The words most often typed right before [word]. */
+    fun wordsBefore(word: String, count: Int): List<String> {
+        val found = ArrayList<Pair<String, Float>>()
+        for ((prev, row) in bigrams) row[word]?.let { found.add(prev to it) }
+        return found.sortedByDescending { it.second }.take(count).map { it.first }
+    }
+
     fun learn(previous: String, word: String, weight: Float) {
         dataVersion++
         unigrams[word] = (unigrams[word] ?: 0f) + weight

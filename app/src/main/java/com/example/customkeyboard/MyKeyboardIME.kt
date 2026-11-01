@@ -967,6 +967,9 @@ class MyKeyboardIME : InputMethodService() {
         voiceIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // Android 13+: let the recognizer add commas, periods and question marks itself.
+            // The formatted text comes first in the results. Recognizers that can't just ignore it.
+            putExtra("android.speech.extra.ENABLE_FORMATTING", "quality")
             // Ask the recognizer to wait out pauses too; many ignore this, so the keyboard
             // also restarts it after each stretch of speech (see onResults).
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, VOICE_SILENCE_MS)
@@ -1056,11 +1059,19 @@ class MyKeyboardIME : InputMethodService() {
     private fun commitSpokenText(spoken: String) {
         val ic = currentInputConnection ?: return
         val state = readTextState(ic)
-        var text = spoken.trim()
+        var text = SpokenPunctuation.apply(spoken.trim())
+        if (text.isEmpty()) return
         val sentenceStart = state?.let { it.word.isEmpty() && it.sentenceStart } ?: true
-        if (sentenceStart && autoCapAllowed) text = text.replaceFirstChar { it.uppercase() }
-        val needsSpace = state?.prevChar?.let { !it.isWhitespace() } ?: false
-        ic.commitText((if (needsSpace) " " else "") + text + " ", 1)
+        if (sentenceStart && autoCapAllowed) {
+            text = text.replaceFirstChar { it.uppercase() }
+        } else if (!sentenceStart) {
+            // Recognizers capitalize every stretch of speech; mid-sentence, an everyday word goes back to lowercase.
+            text = SpokenPunctuation.lowerFirstWordIfCommon(text)
+        }
+        val startsWithMark = text[0] in ".,!?;:"
+        val needsSpace = !startsWithMark && (state?.prevChar?.let { !it.isWhitespace() } ?: false)
+        if (startsWithMark && state?.prevChar == ' ') ic.deleteSurroundingText(1, 0)
+        ic.commitText((if (needsSpace) " " else "") + text + (if (text.endsWith("\n")) "" else " "), 1)
         clearAutoSpace()
         pendingCorrection = null
         currentWord.clear()
@@ -1547,13 +1558,13 @@ class MyKeyboardIME : InputMethodService() {
 
         when (config.action) {
             KeyAction.ENTER -> {
-                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
-                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
                 finishWord(currentWord.toString(), 1f)
+                pressEnter(ic)
                 previousWord = WordPredictor.START
                 sentenceEndPending = false
                 lastCharWordish = false
-                autoShift()
+                // A capital after the new line only if the line ended a sentence.
+                readTextState(ic)?.let { applyTextState(it) }
             }
             KeyAction.SHIFT -> {
                 // Turning off a shift the keyboard turned on means "lowercase here".
@@ -1690,6 +1701,32 @@ class MyKeyboardIME : InputMethodService() {
             KeyAction.BACKSPACE, KeyAction.SPACER, KeyAction.CURSOR -> {}
         }
         updatePrediction()
+    }
+
+    /**
+     * Enter types a new line wherever the box takes more than one line
+     * (texts, emails, notes), so it never sends a message by surprise; use
+     * the app's own send button. In one-line boxes (search, web address) it
+     * does what the box asks for: search, go, next, done, send.
+     */
+    private fun pressEnter(ic: InputConnection) {
+        val info = currentInputEditorInfo
+        val type = info?.inputType ?: 0
+        val options = info?.imeOptions ?: 0
+        val isText = (type and InputType.TYPE_MASK_CLASS) == InputType.TYPE_CLASS_TEXT
+        val multiLine = isText && (type and (InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
+        val action = options and EditorInfo.IME_MASK_ACTION
+        val noEnterAction = (options and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
+        when {
+            multiLine -> ic.commitText("\n", 1)
+            !noEnterAction && action != EditorInfo.IME_ACTION_NONE &&
+                    action != EditorInfo.IME_ACTION_UNSPECIFIED -> ic.performEditorAction(action)
+            else -> {
+                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
+                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+            }
+        }
     }
 
     private fun commitDirect(text: String) {
@@ -1858,14 +1895,15 @@ class MyKeyboardIME : InputMethodService() {
         }
 
         val prev = if (before.isEmpty()) null else before[before.length - 1]
+        // A sentence starts after . ! or ? followed by a space or new line (or at the very
+        // start of the box). A new line on its own doesn't count: that's a list.
         val sentenceStart = word.isEmpty() && when {
             prev == null -> reachesFieldStart
-            prev == '\n' -> true
             !prev.isWhitespace() -> false
             else -> {
                 var k = before.length - 1
-                while (k >= 0 && before[k].isWhitespace() && before[k] != '\n') k--
-                if (k < 0) reachesFieldStart else before[k] == '.' || before[k] == '!' || before[k] == '?' || before[k] == '\n'
+                while (k >= 0 && before[k].isWhitespace()) k--
+                if (k < 0) reachesFieldStart else before[k] == '.' || before[k] == '!' || before[k] == '?'
             }
         }
         return TextState(
@@ -1932,17 +1970,7 @@ class MyKeyboardIME : InputMethodService() {
      * first letter of a word is typed, so capitals never depend on earlier
      * state having been kept perfectly in step with the app.
      */
-    private fun atSentenceStart(ic: InputConnection): Boolean {
-        val before = ic.getTextBeforeCursor(6, 0) ?: return false
-        var i = before.length - 1
-        if (i < 0) return true
-        if (before[i] == '\n') return true
-        if (before[i] != ' ') return false
-        while (i >= 0 && before[i] == ' ') i--
-        if (i < 0) return before.length < 6
-        val c = before[i]
-        return c == '.' || c == '!' || c == '?' || c == '\n'
-    }
+    private fun atSentenceStart(ic: InputConnection): Boolean = readTextState(ic)?.sentenceStart ?: false
 
     /**
      * The word just ended: learn it (after the previous word), add it to the
@@ -2042,41 +2070,11 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
 
-        val words = ArrayList<String>()
-        correctionFor(typed)?.let { words.add(matchCase(typed, it)) }
-        for (w in WordPredictor.suggestions(previousWord, typed, 4)) {
-            val shown = matchCase(typed, w)
-            if (words.none { it.equals(shown, ignoreCase = true) }) words.add(shown)
-        }
-        // Nothing (or little) starts with a mistyped word, so offer the closest real words too.
-        if (words.size < 3) {
-            for (w in Autocorrector.nearMatches(typed, previousWord)) {
-                val shown = matchCase(typed, w)
-                if (words.none { it.equals(shown, ignoreCase = true) }) words.add(shown)
-                if (words.size >= 3) break
-            }
-        }
-        val best = words.getOrNull(0)
-        val literal = if (typed.length >= 2 && !isApostrophe(typed.last()) &&
-            (!WordPredictor.isKnown(typed) || correctionFor(typed) != null)
-        ) "\"" + typed + "\"" else null
-
-        val left: CharSequence?
-        val centre: CharSequence?
-        val right: CharSequence?
-        if (literal != null && best != null) {
-            left = literal
-            centre = ghostText(best, typed)
-            right = words.getOrNull(1)
-        } else if (literal != null) {
-            left = null
-            centre = literal
-            right = null
-        } else {
-            left = words.getOrNull(1)
-            centre = if (best != null) ghostText(best, typed) else typed
-            right = words.getOrNull(2)
-        }
+        val bar = Autocorrector.bar(typed, previousWord) { matchCase(typed, it) }
+        val best = bar.best
+        val left: CharSequence? = bar.left
+        val centre: CharSequence? = if (best != null && bar.centre == best) ghostText(best, typed) else bar.centre
+        val right: CharSequence? = bar.right
         acceptWord = best
 
         val slots = arrayOf(left, centre, right)
@@ -2162,16 +2160,9 @@ class MyKeyboardIME : InputMethodService() {
 
     /** Ask the app once whether the cursor sits at the start of a sentence. */
     private fun refreshAutoCap() {
-        if (!autoCapAllowed || gifMode || wordMode) return
+        if (gifMode || wordMode) return
         val ic = currentInputConnection ?: return
-        val atSentenceStart = ic.getCursorCapsMode(InputType.TYPE_TEXT_FLAG_CAP_SENTENCES) != 0
-        if (atSentenceStart) {
-            autoShift()
-        } else if (shiftIsAuto && shiftState == ShiftState.ONCE) {
-            shiftState = ShiftState.OFF
-            shiftIsAuto = false
-            refreshLabels()
-        }
+        readTextState(ic)?.let { applyTextState(it) }
     }
 
     private fun updatePredictionNow() {

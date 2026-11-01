@@ -257,6 +257,12 @@ object WordPredictor {
     /** Words assets/removed_words.txt takes out of the lists (so a lookup can say why a word is missing). */
     private var removedWords: Set<String> = emptySet()
 
+    /** How many words came from wordlist.txt; they are the first entries of [staticWords]. */
+    private var mainListSize = 0
+
+    /** Which hand-made list each extra word came from (wordlist2.txt...), for the lookup. */
+    private var extraSource: Map<String, String> = emptyMap()
+
     /** Words from the hand-made lists (built-in WORDS, wordlist2-4): always trusted as typed. */
     private var curatedWords: Set<String> = WORDS.toHashSet()
 
@@ -378,12 +384,15 @@ object WordPredictor {
         }
         // Extra lists without frequencies, most common first.
         val extras = LinkedHashSet<String>()
+        val source = HashMap<String, String>()
         for (name in listOf("wordlist2.txt", "wordlist3.txt", "wordlist4.txt")) {
             for (line in readList(context, name)) {
                 val w = normalize(line.substringBefore('\t').trim())
-                if (isLearnable(w) && w !in removed) extras.add(w)
+                if (isLearnable(w) && w !in removed && extras.add(w)) source[w] = name
             }
         }
+        extraSource = source
+        mainListSize = if (listed.values.any { it != null }) listed.size else 0
 
         val rarest = listed.values.filterNotNull().minOrNull()
         if (rarest == null) {
@@ -578,65 +587,82 @@ object WordPredictor {
     /** Everything the keyboard knows about one word, for the lookup box in settings. */
     class WordStatus(
         val word: String,
-        /** In the app's built-in word lists. */
+        /** Usable right now: suggested, and kept as typed. */
+        val usable: Boolean,
+        /** In the app's built-in word data (any list). */
         val inDictionary: Boolean,
-        /** Place in the frequency list (1 = most common), if it has one. */
-        val rank: Int?,
+        /** Each place the word is stored, in plain words. */
+        val sources: List<String>,
         val zipf: Double?,
         val added: Boolean,
         /** Taken out by the person. */
         val blocked: Boolean,
-        /** Taken out by the app's own junk-word list. */
+        /** Taken out by the app's own junk-word list (assets/removed_words.txt). */
         val removedByApp: Boolean,
+        val plain: Boolean,
         /** Roughly how often the person has typed it (recent typing counts most). */
         val timesTyped: Float,
-        /** What the keyboard changes it to when space is pressed, if anything. */
-        val correction: String?,
-        /** Real words close to it (when it isn't one). */
-        val near: List<String>,
-        val plain: Boolean
+        /** Words the person typed right before / after it, most often first. */
+        val typedAfter: List<String>,
+        val typedBefore: List<String>,
+        /** Conversation data (ngrams.txt): how often it was seen, and its usual neighbours. Null while loading. */
+        val corpusSeen: Float?,
+        val corpusAfter: List<String>,
+        val corpusBefore: List<String>
     )
 
     fun lookup(word: String): WordStatus {
         val w = normalize(word.trim())
         val inDict = rank.containsKey(w)
+        val sources = ArrayList<String>()
         val r = rank[w]
-        val known = isKnown(w)
+        if (r != null && r < mainListSize) {
+            val z = zipfOf(w)
+            val how = when {
+                z == null -> ""
+                z >= 5.0 -> "very common"
+                z >= 4.0 -> "common"
+                z >= 3.0 -> "uncommon"
+                else -> "rare"
+            }
+            sources.add("wordlist.txt, the big frequency list from web text: #${"%,d".format(r + 1)} of " +
+                    "${"%,d".format(mainListSize)}" + (if (how.isEmpty()) "" else ", $how") +
+                    (if (z != null) " (Zipf ${"%.2f".format(z)})" else ""))
+        }
+        if (w in WORDS) sources.add("the built-in everyday list (in the app's code)")
+        extraSource[w]?.let { sources.add("$it, a hand-picked list") }
+        if (user.isAdded(w)) sources.add("your added words")
+
+        val tables = ngrams
+        var corpusAfter = emptyList<String>()
+        var corpusBefore = emptyList<String>()
+        var corpusSeen: Float? = null
+        if (tables != null) {
+            corpusSeen = tables.contexts[w]?.get(0) ?: 0f
+            corpusAfter = tables.pairs[w]?.entries?.sortedByDescending { it.value }?.take(5)?.map { it.key }
+                ?: emptyList()
+            val before = ArrayList<Pair<String, Float>>()
+            for ((prev, row) in tables.pairs) row[w]?.let { before.add(prev to it) }
+            corpusBefore = before.sortedByDescending { it.second }.take(5).map { it.first }
+        }
         return WordStatus(
             word = w,
+            usable = isKnown(w),
             inDictionary = inDict,
-            rank = if (inDict && r != null && staticFreq != null && r < staticWords.size) r + 1 else null,
+            sources = sources,
             zipf = if (inDict) zipfOf(w) else null,
             added = user.isAdded(w),
             blocked = user.isBlocked(w),
             removedByApp = w in removedWords,
+            plain = isLearnable(w),
             timesTyped = user.unigramCount(w),
-            correction = if (w.length >= 2) Autocorrector.correctionFor(w) else null,
-            near = if (known) emptyList() else Autocorrector.nearMatches(w),
-            plain = isLearnable(w)
+            typedAfter = user.bigramRow(w)?.entries?.sortedByDescending { it.value }?.take(5)?.map { it.key }
+                ?: emptyList(),
+            typedBefore = user.wordsBefore(w, 5),
+            corpusSeen = corpusSeen,
+            corpusAfter = corpusAfter,
+            corpusBefore = corpusBefore
         )
-    }
-
-    fun addedWords(): List<String> = user.addedWordList()
-
-    fun clearAddedWords() = user.clearAddedWords()
-
-    /**
-     * assets/forget_words.txt: words to wipe from the person's own data (added
-     * words and everything learned) after an update. Each word is wiped once,
-     * so adding it again later on the phone sticks.
-     */
-    private fun applyForgetList(context: Context) {
-        val prefs = context.getSharedPreferences("word_cleanup", Context.MODE_PRIVATE)
-        val done = prefs.getStringSet("forgotten", null) ?: emptySet()
-        val todo = HashSet<String>()
-        for (line in readList(context, "forget_words.txt")) {
-            val w = normalize(line.substringBefore('#').trim())
-            if (w.isNotEmpty() && w !in done) todo.add(w)
-        }
-        if (todo.isEmpty()) return
-        user.forget(todo)
-        prefs.edit().putStringSet("forgotten", HashSet(done + todo)).apply()
     }
 
     // ---------- export / import of the person's data (see WordListFile) ----------

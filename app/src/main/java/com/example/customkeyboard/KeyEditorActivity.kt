@@ -17,6 +17,7 @@ import android.widget.Button
 import android.widget.CompoundButton
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.SeekBar
@@ -136,7 +137,7 @@ class KeyEditorActivity : Activity() {
             setPadding(0, dp(16), 0, dp(4))
         })
         val lookupInput = EditText(this).apply {
-            hint = "Type a word to check"
+            hint = "Type a word or a misspelling to check"
             isSingleLine = true
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
         }
@@ -161,50 +162,113 @@ class KeyEditorActivity : Activity() {
             blockedList.visibility = if (list.isEmpty()) View.GONE else View.VISIBLE
         }
 
+        val chipsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val chipsScroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
+            addView(chipsRow)
+        }
+        chipsRow.addView(TextView(this).apply { text = "Look up: "; textSize = 12f; alpha = 0.7f })
+
         fun refreshLookup() {
             val typed = lookupInput.text.toString().trim()
+            while (chipsRow.childCount > 1) chipsRow.removeViewAt(1)
             if (typed.isEmpty()) {
-                lookupResult.text = "Shows whether a word is in the keyboard's words, how common it is, " +
-                    "and what the keyboard does with it."
+                lookupResult.text = "Type any word, including a misspelling, to see where it's stored, " +
+                    "where its suggestions come from, and what space changes it to."
                 lookupButtons.visibility = View.GONE
+                chipsScroll.visibility = View.GONE
                 return
             }
             val st = WordPredictor.lookup(typed)
-            val lines = ArrayList<String>()
-            val usable = (st.inDictionary && !st.blocked) || st.added
-            when {
-                st.blocked -> lines.add("✗ \"${st.word}\" is in the word list, but you removed it, so it's never suggested.")
-                st.inDictionary -> {
-                    val how = when {
-                        st.zipf == null -> ""
-                        st.zipf >= 5.0 -> ", very common"
-                        st.zipf >= 4.0 -> ", common"
-                        st.zipf >= 3.0 -> ", uncommon"
-                        else -> ", rare"
-                    }
-                    val place = st.rank?.let { " (#${"%,d".format(it)} by frequency$how)" } ?: ""
-                    lines.add("✓ \"${st.word}\" is in the word list$place.")
-                }
-                st.added -> lines.add("✓ \"${st.word}\" is one of your added words.")
-                st.removedByApp -> lines.add("✗ \"${st.word}\" isn't in the word list (the app filters it out as a common typo).")
-                !st.plain -> lines.add("✗ \"${st.word}\" isn't a plain word (letters and inner apostrophes only).")
-                else -> lines.add("✗ \"${st.word}\" isn't in the word list.")
-            }
-            if (st.inDictionary && st.added && !st.blocked) lines.add("It's also in your added words.")
-            if (st.timesTyped >= 0.5f) lines.add("You've typed it about ${Math.round(st.timesTyped)} times recently.")
-            if (st.correction != null) {
-                lines.add("Typed on its own, space changes it to \"${st.correction}\".")
-            } else if (usable) {
-                lines.add("It's kept exactly as typed.")
-            }
-            if (!usable && st.near.isNotEmpty()) {
-                lines.add("Closest words: " + st.near.joinToString(", "))
-            }
-            lookupResult.text = lines.joinToString("\n")
+            fun shown(w: String) = if (w == WordPredictor.START) "(start of a sentence)" else w
+            fun list(ws: List<String>) = ws.joinToString(", ") { shown(it) }
+            val out = StringBuilder()
 
-            takeOutButton.visibility = if (usable) View.VISIBLE else View.GONE
-            putBackButton.text = if (st.blocked) "Put back" else "Add to keyboard"
-            putBackButton.visibility = if (!usable && (st.blocked || st.plain)) View.VISIBLE else View.GONE
+            // Where it's stored.
+            out.append(if (st.usable) "✓ \"${st.word}\" is a word the keyboard uses.\n" else "✗ \"${st.word}\" is not a word the keyboard uses.\n")
+            if (st.sources.isNotEmpty()) {
+                out.append("Stored in:\n")
+                for (src in st.sources) out.append("  • ").append(src).append('\n')
+            } else {
+                out.append("Not stored in any word list or your added words.\n")
+            }
+            if (st.blocked) out.append("You removed it, so it's never suggested or used as a correction.\n")
+            if (st.removedByApp) out.append("The app's junk-word list (removed_words.txt) filters it out of the big list.\n")
+            if (!st.plain) out.append("It isn't a plain word (letters and inner apostrophes only), so it can't be stored.\n")
+
+            // What the keyboard learned from you.
+            out.append('\n')
+            if (st.timesTyped >= 0.5f) {
+                out.append("Your typing: about ${Math.round(st.timesTyped)} times recently.")
+                if (st.typedBefore.isNotEmpty()) out.append(" Usually after: ${list(st.typedBefore)}.")
+                if (st.typedAfter.isNotEmpty()) out.append(" Usually followed by: ${list(st.typedAfter)}.")
+                out.append('\n')
+            } else {
+                out.append("Your typing: never learned from what you typed.\n")
+            }
+
+            // The conversation data behind next-word guesses.
+            val seen = st.corpusSeen
+            when {
+                seen == null -> {
+                    out.append("Conversation data: still loading…\n")
+                    lookupInput.postDelayed({ refreshLookup() }, 1500L)
+                }
+                seen <= 0f && st.corpusBefore.isEmpty() -> out.append("Conversation data: never seen.\n")
+                else -> {
+                    out.append("Conversation data: seen ${"%,d".format(Math.round(seen))} times.")
+                    if (st.corpusBefore.isNotEmpty()) out.append(" Usually after: ${list(st.corpusBefore)}.")
+                    if (st.corpusAfter.isNotEmpty()) out.append(" Usually followed by: ${list(st.corpusAfter)}.")
+                    out.append('\n')
+                }
+            }
+
+            // What happens when it's typed.
+            out.append('\n')
+            val correction = if (st.word.length >= 2) Autocorrector.correctionFor(st.word) else null
+            if (correction != null && !correction.equals(st.word, ignoreCase = true)) {
+                val (cost, steps) = Autocorrector.explain(st.word, correction)
+                out.append("Typed and followed by space, it changes to \"$correction\"")
+                if (steps.isNotEmpty()) out.append(": ").append(steps.joinToString(", "))
+                out.append(".\n")
+                if (!st.usable) {
+                    out.append("  (${"%.1f".format(cost)} of the ${"%.1f".format(Autocorrector.allowedDistance(st.word.length))} " +
+                        "allowed for a ${st.word.length}-letter word; likelier words win ties.)\n")
+                } else {
+                    out.append("  (It's a rare entry in the big list, and \"$correction\" is far more common and one slip away.)\n")
+                }
+            } else if (st.usable) {
+                out.append("Typed and followed by space, it's kept exactly as typed.\n")
+            } else {
+                out.append("Typed and followed by space, it's kept as typed: no real word is close enough.\n")
+            }
+            val bar = Autocorrector.bar(st.word, "")
+            out.append("Suggestion bar while typing it: ")
+                .append(listOf(bar.left, bar.centre, bar.right).joinToString("  |  ") { it ?: "—" })
+            lookupResult.text = out.toString()
+
+            // Tap a related word to look that one up too.
+            val related = LinkedHashSet<String>()
+            correction?.let { related.add(WordPredictor.normalize(it)) }
+            for (w in bar.words) related.add(WordPredictor.normalize(w))
+            if (!st.usable) for (w in Autocorrector.nearMatches(st.word)) related.add(w)
+            related.remove(st.word)
+            for (w in related) {
+                chipsRow.addView(Button(this).apply {
+                    text = w
+                    isAllCaps = false
+                    textSize = 12f
+                    setOnClickListener {
+                        lookupInput.setText(w)
+                        lookupInput.setSelection(w.length)
+                    }
+                })
+            }
+            chipsScroll.visibility = if (related.isEmpty()) View.GONE else View.VISIBLE
+
+            takeOutButton.visibility = if (st.usable) View.VISIBLE else View.GONE
+            putBackButton.text = if (st.blocked) "Put back" else "Add as my word"
+            putBackButton.visibility = if (!st.usable && (st.blocked || st.plain)) View.VISIBLE else View.GONE
             lookupButtons.visibility = View.VISIBLE
         }
 
@@ -232,6 +296,7 @@ class KeyEditorActivity : Activity() {
         lookupInput.doAfterTextChanged { refreshLookup() }
         controls.addView(lookupInput)
         controls.addView(lookupResult)
+        controls.addView(chipsScroll)
         controls.addView(lookupButtons)
         controls.addView(blockedList)
         refreshLookup()

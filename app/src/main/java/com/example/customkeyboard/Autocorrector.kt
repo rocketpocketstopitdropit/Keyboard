@@ -260,4 +260,101 @@ object Autocorrector {
     }
 
     private const val NEAR_COUNT = 4
+
+    // ---------- the suggestion bar (shared by the keyboard and the lookup in settings) ----------
+
+    /** The three slots of the suggestion bar. [best] is what a flick up on space accepts. */
+    class Bar(val left: String?, val centre: String?, val right: String?, val best: String?, val words: List<String>)
+
+    /**
+     * What the suggestion bar shows for [typed] after [previousWord]: the
+     * autocorrection, then words that start with what was typed, then the
+     * closest real words. If the typed word isn't a real word (or would be
+     * corrected) it also appears on the left in quotes, to keep it as typed.
+     * [shape] matches each word to the typed capitals.
+     */
+    fun bar(typed: String, previousWord: String, shape: (String) -> String = { it }): Bar {
+        val words = ArrayList<String>()
+        val correction = correctionFor(typed, previousWord)
+        correction?.let { words.add(shape(it)) }
+        fun offer(w: String) {
+            val shown = shape(w)
+            if (words.none { it.equals(shown, ignoreCase = true) }) words.add(shown)
+        }
+        for (w in WordPredictor.suggestions(previousWord, typed, 4)) offer(w)
+        // Nothing (or little) starts with a mistyped word, so offer the closest real words too.
+        if (words.size < 3) {
+            for (w in nearMatches(typed, previousWord)) {
+                offer(w)
+                if (words.size >= 3) break
+            }
+        }
+        val best = words.getOrNull(0)
+        val literal = if (typed.length >= 2 && typed.last() != '\'' && typed.last() != '\u2019' &&
+            (!WordPredictor.isKnown(typed) || correction != null)
+        ) "\"" + typed + "\"" else null
+        return when {
+            literal != null && best != null -> Bar(literal, best, words.getOrNull(1), best, words)
+            literal != null -> Bar(null, literal, null, null, words)
+            else -> Bar(words.getOrNull(1), best ?: typed, words.getOrNull(2), best, words)
+        }
+    }
+
+    // ---------- explaining a correction ----------
+
+    /**
+     * In plain words, how [typed] differs from [target]: the cheapest set of
+     * slips, the same way the autocorrector counts them, e.g.
+     * "r instead of e (next key)", "missing y", "extra o".
+     */
+    fun explain(typed: String, target: String): Pair<Double, List<String>> {
+        val a = WordPredictor.normalize(typed)
+        val b = WordPredictor.normalize(target)
+        val n = a.length
+        val m = b.length
+        val d = Array(n + 1) { DoubleArray(m + 1) }
+        for (j in 0..m) d[0][j] = j.toDouble()
+        for (i in 1..n) {
+            d[i][0] = i.toDouble()
+            val extraCost = if (i > 1 && a[i - 1] == a[i - 2]) DOUBLED_COST else 1.0
+            for (j in 1..m) {
+                var best = d[i - 1][j - 1] + substitutionCost(a[i - 1], b[j - 1])
+                best = minOf(best, d[i - 1][j] + extraCost, d[i][j - 1] + missingCost(b, j - 1))
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
+                    best = minOf(best, d[i - 2][j - 2] + TRANSPOSE_COST)
+                }
+                d[i][j] = best
+            }
+        }
+        val steps = ArrayList<String>()
+        var i = n
+        var j = m
+        fun near(x: Double, y: Double) = abs(x - y) < 1e-9
+        while (i > 0 || j > 0) {
+            val here = d[i][j]
+            if (i > 0 && j > 0 && near(here, d[i - 1][j - 1] + substitutionCost(a[i - 1], b[j - 1]))) {
+                val c = substitutionCost(a[i - 1], b[j - 1])
+                if (c > 0.0) {
+                    steps.add("${a[i - 1]} instead of ${b[j - 1]}" + if (c < 1.0) " (next key)" else "")
+                }
+                i--; j--
+            } else if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] &&
+                near(here, d[i - 2][j - 2] + TRANSPOSE_COST)
+            ) {
+                steps.add("${a[i - 2]}${a[i - 1]} swapped")
+                i -= 2; j -= 2
+            } else if (j > 0 && near(here, d[i][j - 1] + missingCost(b, j - 1))) {
+                steps.add("missing ${b[j - 1]}")
+                j--
+            } else {
+                steps.add("extra ${a[i - 1]}")
+                i--
+            }
+        }
+        steps.reverse()
+        return d[n][m] to steps
+    }
+
+    /** The most a word of this length may be off and still be autocorrected. */
+    fun allowedDistance(length: Int): Double = limitFor(length)
 }
