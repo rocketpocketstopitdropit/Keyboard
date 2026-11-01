@@ -665,6 +665,28 @@ object WordPredictor {
         )
     }
 
+    fun addedWords(): List<String> = user.addedWordList()
+
+    fun clearAddedWords() = user.clearAddedWords()
+
+    /**
+     * assets/forget_words.txt: words to wipe from the person's own data (added
+     * words and everything learned) after an update. Each word is wiped once,
+     * so adding it again later on the phone sticks.
+     */
+    private fun applyForgetList(context: Context) {
+        val prefs = context.getSharedPreferences("word_cleanup", Context.MODE_PRIVATE)
+        val done = prefs.getStringSet("forgotten", null) ?: emptySet()
+        val todo = HashSet<String>()
+        for (line in readList(context, "forget_words.txt")) {
+            val w = normalize(line.substringBefore('#').trim())
+            if (w.isNotEmpty() && w !in done) todo.add(w)
+        }
+        if (todo.isEmpty()) return
+        user.forget(todo)
+        prefs.edit().putStringSet("forgotten", HashSet(done + todo)).apply()
+    }
+
     // ---------- export / import of the person's data (see WordListFile) ----------
 
     /** A plain word: letters with inner apostrophes, nothing odd. */
