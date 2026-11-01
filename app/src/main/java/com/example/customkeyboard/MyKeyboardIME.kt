@@ -166,6 +166,20 @@ class MyKeyboardIME : InputMethodService() {
 
     private var speechRecognizer: SpeechRecognizer? = null
     private var listening = false
+    /** Silence ran out or the mic was tapped: the current stretch of speech is the last one. */
+    private var voiceFinishing = false
+    private var voiceIntent: Intent? = null
+    private val voiceSilenceRunnable = Runnable { finishListening() }
+    private val voiceRestartRunnable = Runnable { restartVoiceSegment() }
+    private val voiceGiveUpRunnable = Runnable { stopListening() }
+
+    // The word being typed is re-read from the text after a pause, so moving the
+    // cursor, tapping into a word or switching pages never leaves it out of step.
+    private val resyncRunnable = Runnable { resyncFromText() }
+    private var lastKeyTime = 0L
+
+    /** Never take over the whole screen with a separate text box (landscape, unfolded): type straight into the app. */
+    override fun onEvaluateFullscreenMode(): Boolean = false
 
     override fun onCreate() {
         super.onCreate()
@@ -933,7 +947,7 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
         if (listening) {
-            stopListening()
+            finishListening()
         } else {
             startListening()
         }
@@ -947,39 +961,121 @@ class MyKeyboardIME : InputMethodService() {
         val recognizer = SpeechRecognizer.createSpeechRecognizer(this)
         speechRecognizer = recognizer
         listening = true
+        voiceFinishing = false
         micButton?.text = "⏺"
 
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        voiceIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // Ask the recognizer to wait out pauses too; many ignore this, so the keyboard
+            // also restarts it after each stretch of speech (see onResults).
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, VOICE_SILENCE_MS)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, VOICE_SILENCE_MS)
         }
         recognizer.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle?) {
+                if (speechRecognizer !== recognizer) return
                 val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-                    ?.replaceFirstChar { it.uppercase() }
                 if (!text.isNullOrBlank()) {
-                    currentInputConnection?.commitText("$text ", 1)
-                    clearAutoSpace()
+                    commitSpokenText(text)
+                    heardSpeech()
                 }
-                stopListening()
+                // The recognizer stops at the first short pause. Keep listening until
+                // three seconds have passed since the last word.
+                if (voiceFinishing) stopListening() else restartVoiceSegment()
             }
             override fun onError(error: Int) {
-                stopListening()
+                if (speechRecognizer !== recognizer) return
+                val quietOnly = error == SpeechRecognizer.ERROR_NO_MATCH ||
+                        error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                        error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                if (quietOnly && !voiceFinishing) {
+                    uiHandler.removeCallbacks(voiceRestartRunnable)
+                    uiHandler.postDelayed(voiceRestartRunnable, 150L)
+                } else {
+                    stopListening()
+                }
             }
             override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
+            override fun onBeginningOfSpeech() { heardSpeech() }
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
             override fun onEndOfSpeech() {}
-            override fun onPartialResults(partialResults: Bundle?) {}
+            override fun onPartialResults(partialResults: Bundle?) {
+                val partial = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                if (!partial.isNullOrBlank()) heardSpeech()
+            }
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
-        recognizer.startListening(intent)
+        recognizer.startListening(voiceIntent)
+        // A little longer to get the first word out.
+        uiHandler.removeCallbacks(voiceSilenceRunnable)
+        uiHandler.postDelayed(voiceSilenceRunnable, VOICE_FIRST_WORD_MS)
+    }
+
+    /** Words were just heard: the three-second countdown starts over. */
+    private fun heardSpeech() {
+        if (!listening || voiceFinishing) return
+        uiHandler.removeCallbacks(voiceSilenceRunnable)
+        uiHandler.postDelayed(voiceSilenceRunnable, VOICE_SILENCE_MS)
+    }
+
+    private fun restartVoiceSegment() {
+        val recognizer = speechRecognizer ?: return
+        val intent = voiceIntent ?: return
+        if (!listening || voiceFinishing) return
+        try {
+            recognizer.startListening(intent)
+        } catch (e: Exception) {
+            stopListening()
+        }
+    }
+
+    /** Three seconds of quiet (or the mic tapped): keep what was said, then stop. */
+    private fun finishListening() {
+        val recognizer = speechRecognizer
+        if (!listening || recognizer == null) {
+            stopListening()
+            return
+        }
+        voiceFinishing = true
+        uiHandler.removeCallbacks(voiceSilenceRunnable)
+        uiHandler.removeCallbacks(voiceRestartRunnable)
+        try {
+            recognizer.stopListening()
+        } catch (e: Exception) {
+            stopListening()
+            return
+        }
+        // If the recognizer never answers, don't leave the mic on.
+        uiHandler.removeCallbacks(voiceGiveUpRunnable)
+        uiHandler.postDelayed(voiceGiveUpRunnable, 2000L)
+    }
+
+    /** Spoken words go in with a space before them when needed, capitalized only at a sentence start. */
+    private fun commitSpokenText(spoken: String) {
+        val ic = currentInputConnection ?: return
+        val state = readTextState(ic)
+        var text = spoken.trim()
+        val sentenceStart = state?.let { it.word.isEmpty() && it.sentenceStart } ?: true
+        if (sentenceStart && autoCapAllowed) text = text.replaceFirstChar { it.uppercase() }
+        val needsSpace = state?.prevChar?.let { !it.isWhitespace() } ?: false
+        ic.commitText((if (needsSpace) " " else "") + text + " ", 1)
+        clearAutoSpace()
+        pendingCorrection = null
+        currentWord.clear()
+        readTextState(ic)?.let { applyTextState(it) }
+        updatePrediction()
     }
 
     private fun stopListening() {
+        uiHandler.removeCallbacks(voiceSilenceRunnable)
+        uiHandler.removeCallbacks(voiceRestartRunnable)
+        uiHandler.removeCallbacks(voiceGiveUpRunnable)
         speechRecognizer?.destroy()
         speechRecognizer = null
         listening = false
+        voiceFinishing = false
         micButton?.text = "🎤"
     }
 
@@ -1394,6 +1490,7 @@ class MyKeyboardIME : InputMethodService() {
         if (gifMode && handleGifKey(config)) return
         if (wordMode && handleWordKey(config)) return
         val ic = currentInputConnection ?: return
+        lastKeyTime = SystemClock.uptimeMillis()
 
         if (config.action == KeyAction.CHAR && config.commitOverride == null &&
             attachPunctuation(ic, outputFor(config))
@@ -1434,6 +1531,9 @@ class MyKeyboardIME : InputMethodService() {
                     ic.deleteSurroundingText(1, 0)
                     if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
                 }
+                // Backing into the word before (or out of one): read it back from the text,
+                // so predictions use exactly the letters between the last space and the cursor.
+                if (currentWord.isEmpty()) readTextState(ic)?.let { applyTextState(it) }
             }
             updatePrediction()
             return
@@ -1518,6 +1618,8 @@ class MyKeyboardIME : InputMethodService() {
                     null
                 } else {
                     correctionFor(typed)?.let { matchCase(typed, it) }
+                        // Splitting a word in the middle: leave the front half as typed.
+                        ?.takeUnless { letterAfterCursor(ic) }
                 }
                 if (correction != null) {
                     ic.deleteSurroundingText(typed.length, 0)
@@ -1542,8 +1644,17 @@ class MyKeyboardIME : InputMethodService() {
             }
             KeyAction.CHAR -> {
                 var text = config.commitOverride ?: outputFor(config)
-                if (text.length == 1 && text[0].isLowerCase() && currentWord.isEmpty() &&
-                    config.commitOverride == null && autoCapAllowed && shiftState == ShiftState.OFF &&
+                val letterKey = text.length == 1 && text[0].isLetter() && config.commitOverride == null
+                val state = if (letterKey && currentWord.isEmpty()) readTextState(ic) else null
+                if (state != null) {
+                    // Picks up a word the cursor is already touching ("hel|" -> "hello"), the
+                    // two words before it, and whether a capital is due. A capital is only
+                    // automatic after a space or new line at a sentence start, never
+                    // straight after a letter or punctuation mark.
+                    applyTextState(state)
+                    text = outputFor(config)
+                } else if (letterKey && text[0].isLowerCase() && currentWord.isEmpty() &&
+                    autoCapAllowed && shiftState == ShiftState.OFF &&
                     !autoCapCancelled && atSentenceStart(ic)
                 ) {
                     text = text.uppercase()
@@ -1597,6 +1708,7 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
         val ic = currentInputConnection ?: return
+        lastKeyTime = SystemClock.uptimeMillis()
         if (attachPunctuation(ic, text)) return
         clearAutoSpace()
         pendingCorrection = null
@@ -1686,6 +1798,132 @@ class MyKeyboardIME : InputMethodService() {
         pendingCorrection = typed to correction
         pendingCorrectionPrev = previousWord
         return correction
+    }
+
+    /** What the text right before the cursor says about the word being typed. */
+    private class TextState(
+        /** Letters (and inner apostrophes) between the last space or punctuation and the cursor. */
+        val word: String,
+        /** Up to two words before it, oldest first, in the form the predictor wants. */
+        val context: String,
+        /** The character right before the cursor, or null at the start of the field. */
+        val prevChar: Char?,
+        /** The word started straight after a number ("13th"). */
+        val afterDigit: Boolean,
+        /** A new sentence starts at the cursor (after ". ", a new line, or at the very start). */
+        val sentenceStart: Boolean
+    )
+
+    private fun isWordChar(c: Char): Boolean = c.isLetter() || isApostrophe(c)
+
+    private fun readTextState(ic: InputConnection): TextState? {
+        val before = ic.getTextBeforeCursor(CONTEXT_CHARS, 0)?.toString() ?: return null
+        return parseTextState(before, before.length < CONTEXT_CHARS)
+    }
+
+    private fun parseTextState(before: String, reachesFieldStart: Boolean): TextState {
+        var start = before.length
+        while (start > 0 && isWordChar(before[start - 1])) start--
+        var wordStart = start
+        // A leading apostrophe is a quote mark, not part of the word.
+        while (wordStart < before.length && isApostrophe(before[wordStart])) wordStart++
+        val word = before.substring(wordStart)
+
+        // Walk back over the two words before it, stopping at a sentence end.
+        val words = ArrayList<String>(2)
+        var i = start
+        var hitSentenceStart = false
+        while (i > 0 && words.size < 2) {
+            val c = before[i - 1]
+            if (c == '.' || c == '!' || c == '?' || c == '\n') {
+                hitSentenceStart = true
+                break
+            }
+            if (isWordChar(c)) {
+                var j = i
+                while (j > 0 && isWordChar(before[j - 1])) j--
+                val w = before.substring(j, i).trim('\'', '\u2019')
+                if (w.isNotEmpty()) words.add(0, WordPredictor.normalize(w))
+                i = j
+            } else {
+                i--
+            }
+        }
+        if (i == 0 && reachesFieldStart) hitSentenceStart = true
+        val context = when {
+            words.size >= 2 -> words[0] + " " + words[1]
+            words.size == 1 -> if (hitSentenceStart) WordPredictor.START + " " + words[0] else words[0]
+            hitSentenceStart -> WordPredictor.START
+            else -> ""
+        }
+
+        val prev = if (before.isEmpty()) null else before[before.length - 1]
+        val sentenceStart = word.isEmpty() && when {
+            prev == null -> reachesFieldStart
+            prev == '\n' -> true
+            !prev.isWhitespace() -> false
+            else -> {
+                var k = before.length - 1
+                while (k >= 0 && before[k].isWhitespace() && before[k] != '\n') k--
+                if (k < 0) reachesFieldStart else before[k] == '.' || before[k] == '!' || before[k] == '?' || before[k] == '\n'
+            }
+        }
+        return TextState(
+            word = word,
+            context = context,
+            prevChar = prev,
+            afterDigit = word.isNotEmpty() && wordStart > 0 && before[wordStart - 1].isDigit(),
+            sentenceStart = sentenceStart
+        )
+    }
+
+    /** Bring the word being typed, its context and the automatic capital in line with the text. Returns true if anything changed. */
+    private fun applyTextState(state: TextState): Boolean {
+        var changed = false
+        if (state.word != currentWord.toString()) {
+            currentWord.setLength(0)
+            currentWord.append(state.word)
+            // The last autocorrection is no longer right behind the cursor.
+            pendingCorrection = null
+            wordAfterDigit = state.afterDigit
+            changed = true
+        }
+        if (state.context != previousWord) {
+            previousWord = state.context
+            changed = true
+        }
+        val prev = state.prevChar
+        lastCharWordish = prev != null && prev.isLetterOrDigit()
+        lastCharDigit = prev != null && prev.isDigit()
+        if (autoCapAllowed && !gifMode && !wordMode) {
+            if (state.sentenceStart && !autoCapCancelled) {
+                autoShift()
+            } else if (!state.sentenceStart && shiftIsAuto && shiftState == ShiftState.ONCE) {
+                shiftState = ShiftState.OFF
+                shiftIsAuto = false
+                refreshLabels()
+            }
+        }
+        return changed
+    }
+
+    /** After a pause: if the cursor moved or the text changed underneath, re-read the word. */
+    private fun resyncFromText() {
+        if (gifMode || wordMode || selStart != selEnd) return
+        val waited = SystemClock.uptimeMillis() - lastKeyTime
+        if (waited < RESYNC_DELAY_MS) {
+            uiHandler.postDelayed(resyncRunnable, RESYNC_DELAY_MS - waited)
+            return
+        }
+        val ic = currentInputConnection ?: return
+        val state = readTextState(ic) ?: return
+        if (applyTextState(state)) updatePrediction()
+    }
+
+    /** True when the cursor sits right in front of more letters (splitting a word). */
+    private fun letterAfterCursor(ic: InputConnection): Boolean {
+        val after = ic.getTextAfterCursor(1, 0)
+        return !after.isNullOrEmpty() && isWordChar(after[0])
     }
 
     /**
@@ -1809,6 +2047,14 @@ class MyKeyboardIME : InputMethodService() {
         for (w in WordPredictor.suggestions(previousWord, typed, 4)) {
             val shown = matchCase(typed, w)
             if (words.none { it.equals(shown, ignoreCase = true) }) words.add(shown)
+        }
+        // Nothing (or little) starts with a mistyped word, so offer the closest real words too.
+        if (words.size < 3) {
+            for (w in Autocorrector.nearMatches(typed, previousWord)) {
+                val shown = matchCase(typed, w)
+                if (words.none { it.equals(shown, ignoreCase = true) }) words.add(shown)
+                if (words.size >= 3) break
+            }
         }
         val best = words.getOrNull(0)
         val literal = if (typed.length >= 2 && !isApostrophe(typed.last()) &&
@@ -1984,6 +2230,8 @@ class MyKeyboardIME : InputMethodService() {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         selStart = newSelStart
         selEnd = newSelEnd
+        uiHandler.removeCallbacks(resyncRunnable)
+        uiHandler.postDelayed(resyncRunnable, RESYNC_DELAY_MS)
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
@@ -1991,6 +2239,7 @@ class MyKeyboardIME : InputMethodService() {
         cancelAllTouches()
         uiHandler.removeCallbacks(predictionRunnable)
         uiHandler.removeCallbacks(flushRunnable)
+        uiHandler.removeCallbacks(resyncRunnable)
         stopListening()
         WordPredictor.flush()
     }
@@ -2016,6 +2265,17 @@ class MyKeyboardIME : InputMethodService() {
             @Suppress("DEPRECATION")
             v.vibrate(12L)
         }
+    }
+
+    private companion object {
+        /** How much text before the cursor is read to find the current word and the two before it. */
+        const val CONTEXT_CHARS = 100
+        /** Quiet time after typing before the word is re-read from the text. */
+        const val RESYNC_DELAY_MS = 300L
+        /** Voice typing stops this long after the last word heard. */
+        const val VOICE_SILENCE_MS = 3000L
+        /** ...or this long after tapping the mic if nothing is said at all. */
+        const val VOICE_FIRST_WORD_MS = 5000L
     }
 
     private fun dp(value: Int): Int =

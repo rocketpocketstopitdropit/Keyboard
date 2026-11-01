@@ -27,6 +27,9 @@ class UserLanguageModel {
 
     /** Words the person chose to add. They count as real words everywhere. */
     private val addedWords = LinkedHashSet<String>()
+
+    /** Dictionary words the person took out. They are never suggested or used as corrections. */
+    private val blockedWords = HashSet<String>()
     private var dictPrefs: SharedPreferences? = null
 
     /** Bumped whenever the set of usable words changes, so caches can rebuild. */
@@ -80,12 +83,15 @@ class UserLanguageModel {
         addedWords.clear()
         val stored = dictPrefs?.getStringSet(DICT_KEY, null)
         if (stored != null) addedWords.addAll(stored)
+        blockedWords.clear()
+        dictPrefs?.getStringSet(BLOCKED_KEY, null)?.let { blockedWords.addAll(it) }
         vocabularyVersion++
         dataVersion++
     }
 
     fun addWord(word: String): Boolean {
-        if (!addedWords.add(word)) return false
+        val unblocked = blockedWords.remove(word)
+        if (!addedWords.add(word) && !unblocked) return false
         persistAdded()
         vocabularyVersion++
         dataVersion++
@@ -109,7 +115,36 @@ class UserLanguageModel {
     }
 
     private fun persistAdded() {
-        dictPrefs?.edit()?.putStringSet(DICT_KEY, HashSet<String>(addedWords))?.apply()
+        dictPrefs?.edit()
+            ?.putStringSet(DICT_KEY, HashSet<String>(addedWords))
+            ?.putStringSet(BLOCKED_KEY, HashSet<String>(blockedWords))
+            ?.apply()
+    }
+
+    fun isBlocked(word: String): Boolean = blockedWords.contains(word)
+
+    fun blockedWordList(): List<String> = blockedWords.sorted()
+
+    /** Takes a word out completely: not added, not learned, never suggested. */
+    fun blockWord(word: String): Boolean {
+        val wasAdded = addedWords.remove(word)
+        val newlyBlocked = blockedWords.add(word)
+        if (!wasAdded && !newlyBlocked) return false
+        persistAdded()
+        vocabularyVersion++
+        retainWords { it != word }
+        dataVersion++
+        save()
+        return true
+    }
+
+    /** Puts a dictionary word the person took out back in. */
+    fun unblockWord(word: String): Boolean {
+        if (!blockedWords.remove(word)) return false
+        persistAdded()
+        vocabularyVersion++
+        dataVersion++
+        return true
     }
 
     // ---------- counts ----------
@@ -314,6 +349,7 @@ class UserLanguageModel {
         private const val FILE_NAME = "learned_words.tsv"
         private const val DICT_PREFS = "user_dictionary"
         private const val DICT_KEY = "words"
+        private const val BLOCKED_KEY = "blocked_words"
         private const val MAINTENANCE_EVERY = 400
         private const val DECAY = 0.96f
         private const val MIN_KEEP = 0.4f

@@ -28,6 +28,8 @@ import androidx.core.widget.doAfterTextChanged
 class KeyEditorActivity : Activity() {
 
     private lateinit var previewHolder: FrameLayout
+    /** Lets the lookup box refresh the added-words list below it. */
+    private var refreshWordsListLater: (() -> Unit)? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -127,6 +129,114 @@ class KeyEditorActivity : Activity() {
                 KeyboardPrefs.setDoubleSpacePeriod(this, it)
             }
         )
+        // ---- Look up a word: is it in the keyboard's word data, and what happens when it's typed? ----
+        controls.addView(TextView(this).apply {
+            text = "Look up a word"
+            textSize = 14f
+            setPadding(0, dp(16), 0, dp(4))
+        })
+        val lookupInput = EditText(this).apply {
+            hint = "Type a word to check"
+            isSingleLine = true
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        val lookupResult = TextView(this).apply {
+            textSize = 13f
+            setPadding(0, dp(4), 0, dp(4))
+        }
+        val lookupButtons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val takeOutButton = Button(this).apply { text = "Remove from keyboard" }
+        val putBackButton = Button(this).apply { text = "Add to keyboard" }
+        lookupButtons.addView(takeOutButton, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        lookupButtons.addView(putBackButton, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        val blockedList = TextView(this).apply {
+            textSize = 12f
+            alpha = 0.7f
+            setPadding(0, dp(4), 0, dp(4))
+        }
+
+        fun refreshBlockedList() {
+            val list = WordPredictor.blockedWords()
+            blockedList.text = if (list.isEmpty()) "" else "Removed by you (${list.size}): " + list.joinToString(", ")
+            blockedList.visibility = if (list.isEmpty()) View.GONE else View.VISIBLE
+        }
+
+        fun refreshLookup() {
+            val typed = lookupInput.text.toString().trim()
+            if (typed.isEmpty()) {
+                lookupResult.text = "Shows whether a word is in the keyboard's words, how common it is, " +
+                    "and what the keyboard does with it."
+                lookupButtons.visibility = View.GONE
+                return
+            }
+            val st = WordPredictor.lookup(typed)
+            val lines = ArrayList<String>()
+            val usable = (st.inDictionary && !st.blocked) || st.added
+            when {
+                st.blocked -> lines.add("✗ \"${st.word}\" is in the word list, but you removed it, so it's never suggested.")
+                st.inDictionary -> {
+                    val how = when {
+                        st.zipf == null -> ""
+                        st.zipf >= 5.0 -> ", very common"
+                        st.zipf >= 4.0 -> ", common"
+                        st.zipf >= 3.0 -> ", uncommon"
+                        else -> ", rare"
+                    }
+                    val place = st.rank?.let { " (#${"%,d".format(it)} by frequency$how)" } ?: ""
+                    lines.add("✓ \"${st.word}\" is in the word list$place.")
+                }
+                st.added -> lines.add("✓ \"${st.word}\" is one of your added words.")
+                st.removedByApp -> lines.add("✗ \"${st.word}\" isn't in the word list (the app filters it out as a common typo).")
+                !st.plain -> lines.add("✗ \"${st.word}\" isn't a plain word (letters and inner apostrophes only).")
+                else -> lines.add("✗ \"${st.word}\" isn't in the word list.")
+            }
+            if (st.inDictionary && st.added && !st.blocked) lines.add("It's also in your added words.")
+            if (st.timesTyped >= 0.5f) lines.add("You've typed it about ${Math.round(st.timesTyped)} times recently.")
+            if (st.correction != null) {
+                lines.add("Typed on its own, space changes it to \"${st.correction}\".")
+            } else if (usable) {
+                lines.add("It's kept exactly as typed.")
+            }
+            if (!usable && st.near.isNotEmpty()) {
+                lines.add("Closest words: " + st.near.joinToString(", "))
+            }
+            lookupResult.text = lines.joinToString("\n")
+
+            takeOutButton.visibility = if (usable) View.VISIBLE else View.GONE
+            putBackButton.text = if (st.blocked) "Put back" else "Add to keyboard"
+            putBackButton.visibility = if (!usable && (st.blocked || st.plain)) View.VISIBLE else View.GONE
+            lookupButtons.visibility = View.VISIBLE
+        }
+
+        takeOutButton.setOnClickListener {
+            val w = lookupInput.text.toString().trim()
+            if (WordPredictor.blockWord(w)) {
+                Toast.makeText(this, "Removed \"$w\". It won't be suggested again.", Toast.LENGTH_SHORT).show()
+            }
+            refreshLookup()
+            refreshBlockedList()
+            refreshWordsListLater?.invoke()
+        }
+        putBackButton.setOnClickListener {
+            val w = lookupInput.text.toString().trim()
+            val ok = WordPredictor.addWord(w)
+            Toast.makeText(
+                this,
+                if (ok) "\"$w\" is back in the keyboard." else "Couldn't add that word.",
+                Toast.LENGTH_SHORT
+            ).show()
+            refreshLookup()
+            refreshBlockedList()
+            refreshWordsListLater?.invoke()
+        }
+        lookupInput.doAfterTextChanged { refreshLookup() }
+        controls.addView(lookupInput)
+        controls.addView(lookupResult)
+        controls.addView(lookupButtons)
+        controls.addView(blockedList)
+        refreshLookup()
+        refreshBlockedList()
+
         val wordsList = TextView(this).apply {
             textSize = 13f
             setPadding(0, dp(4), 0, dp(8))
@@ -185,6 +295,7 @@ class KeyEditorActivity : Activity() {
         controls.addView(wordButtons)
         controls.addView(wordsList)
         refreshWordsList()
+        refreshWordsListLater = { refreshWordsList() }
         controls.addView(Button(this).apply {
             text = "Clear learned words"
             setOnClickListener {

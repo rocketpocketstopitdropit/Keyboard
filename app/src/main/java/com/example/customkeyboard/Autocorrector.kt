@@ -32,8 +32,18 @@ object Autocorrector {
     /** Below this, two neighbour slips are allowed too. */
     private const val VERY_RARE_ZIPF = 2.5
 
-    /** Longest edit distance that still counts as "clearly a typo". */
+    /** Longest edit distance that still counts as "clearly a typo" (3-4 letter words). */
     private const val MAX_DISTANCE = 1.2
+    /** 5-6 letters: about one and a half slips ("cuatoem" -> "custom"). */
+    private const val MEDIUM_WORD_MAX_DISTANCE = 1.6
+    /** 7+ letters: up to two slips ("postitoon" -> "position", "chrslr" -> "chrysler"). */
+    private const val LONG_WORD_MAX_DISTANCE = 2.2
+    /** Beyond this the first letter has to match, so long-shot fixes stay believable. */
+    private const val SAME_START_ABOVE = 1.2
+
+    private const val VOWEL_MISSING_COST = 0.6
+    private const val DOUBLED_COST = 0.5
+    private const val VOWELS = "aeiouy"
 
     /** Two-letter words are too ambiguous for anything but a single slip. */
     private const val SHORT_WORD_MAX_DISTANCE = 0.35
@@ -68,6 +78,25 @@ object Autocorrector {
     }
 
     /**
+     * Cost of a letter the person skipped. Fast thumbs mostly drop vowels
+     * ("chrslr" for "chrysler") and one half of a double letter ("leter"),
+     * so those cost less than any other missing letter.
+     */
+    private fun missingCost(word: String, at: Int): Double {
+        val c = word[at]
+        if (at > 0 && word[at - 1] == c) return DOUBLED_COST
+        return if (c in VOWELS) VOWEL_MISSING_COST else 1.0
+    }
+
+    /** How far off a typed word may be and still count as a typo: longer words can take more slips. */
+    private fun limitFor(length: Int): Double = when {
+        length <= 2 -> SHORT_WORD_MAX_DISTANCE
+        length <= 4 -> MAX_DISTANCE
+        length <= 6 -> MEDIUM_WORD_MAX_DISTANCE
+        else -> LONG_WORD_MAX_DISTANCE
+    }
+
+    /**
      * Keyboard-aware Damerau-style edit distance. Gives up early (returning
      * a value above [limit]) once no alignment can possibly come in under it.
      */
@@ -83,11 +112,13 @@ object Autocorrector {
         for (i in 1..n) {
             cur[0] = i.toDouble()
             var rowMin = cur[0]
+            // A letter typed twice by accident ("lookk") is a cheap extra letter.
+            val extraCost = if (i > 1 && a[i - 1] == a[i - 2]) DOUBLED_COST else 1.0
             for (j in 1..m) {
                 var best = prev1[j - 1] + substitutionCost(a[i - 1], b[j - 1])
-                val del = prev1[j] + 1.0
+                val del = prev1[j] + extraCost
                 if (del < best) best = del
-                val ins = cur[j - 1] + 1.0
+                val ins = cur[j - 1] + missingCost(b, j - 1)
                 if (ins < best) best = ins
                 if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
                     val swap = prev2[j - 2] + TRANSPOSE_COST
@@ -179,25 +210,54 @@ object Autocorrector {
 
         CONTRACTIONS[lower]?.let { return it }
 
-        val limit = if (lower.length <= 2) SHORT_WORD_MAX_DISTANCE else MAX_DISTANCE
-        val prior = WordPredictor.priorScorer(previousWord)
-        val ws = Workspace(lower.length + 3)
+        val best = nearWords(lower, previousWord).firstOrNull() ?: return null
+        return if (best != lower) best else null
+    }
 
-        var best: String? = null
-        var bestScore = Double.MAX_VALUE
-        // Each insert/delete costs 1.0, so a length gap of 2 can never fit under the
-        // limit: only words one letter shorter, the same length, or one longer are tried.
-        for (length in (lower.length - 1)..(lower.length + 1)) {
+    private var nearTyped: String? = null
+    private var nearPrev: String? = null
+    private var nearStamp = -1
+    private var nearResult: List<String> = emptyList()
+
+    /**
+     * Real words close to an unknown typed word, best first (at most
+     * [NEAR_COUNT]). The first one is the autocorrection; the rest can fill
+     * the suggestion bar when nothing starts with what was typed.
+     */
+    fun nearMatches(typedWord: String, previousWord: String = ""): List<String> {
+        val lower = WordPredictor.normalize(typedWord)
+        if (lower.length < 2 || WordPredictor.isKnown(lower)) return emptyList()
+        return nearWords(lower, previousWord)
+    }
+
+    private fun nearWords(lower: String, previousWord: String): List<String> {
+        val stamp = WordPredictor.vocabularyStamp()
+        if (nearTyped == lower && nearPrev == previousWord && nearStamp == stamp) return nearResult
+        val limit = limitFor(lower.length)
+        val prior = WordPredictor.priorScorer(previousWord)
+        val ws = Workspace(lower.length + 4)
+        // The cheapest a missing or extra letter can be is DOUBLED_COST, which bounds the length gap.
+        val gap = minOf(2, (limit / DOUBLED_COST).toInt())
+        val found = ArrayList<Pair<String, Double>>()
+        for (length in (lower.length - gap)..(lower.length + gap)) {
+            if (length < 1) continue
+            val farLength = abs(length - lower.length) >= 2
             for (candidate in WordPredictor.wordsOfLength(length)) {
+                if (farLength && candidate[0] != lower[0]) continue
                 val d = typoDistance(lower, candidate, limit, ws)
                 if (d > limit) continue
-                val score = d - PRIOR_WEIGHT * prior(candidate)
-                if (score < bestScore) {
-                    bestScore = score
-                    best = candidate
-                }
+                if (d > SAME_START_ABOVE && candidate[0] != lower[0]) continue
+                found.add(candidate to d - PRIOR_WEIGHT * prior(candidate))
             }
         }
-        return if (best != null && best != lower) best else null
+        found.sortBy { it.second }
+        val result = found.take(NEAR_COUNT).map { it.first }
+        nearTyped = lower
+        nearPrev = previousWord
+        nearStamp = stamp
+        nearResult = result
+        return result
     }
+
+    private const val NEAR_COUNT = 4
 }

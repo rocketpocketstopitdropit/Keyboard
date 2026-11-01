@@ -254,6 +254,9 @@ object WordPredictor {
      */
     private var rareZipf: Map<String, Float> = emptyMap()
 
+    /** Words assets/removed_words.txt takes out of the lists (so a lookup can say why a word is missing). */
+    private var removedWords: Set<String> = emptySet()
+
     /** Words from the hand-made lists (built-in WORDS, wordlist2-4): always trusted as typed. */
     private var curatedWords: Set<String> = WORDS.toHashSet()
 
@@ -363,6 +366,7 @@ object WordPredictor {
 
     private fun loadAssetWords(context: Context) {
         val removed = loadRemoved(context)
+        removedWords = removed
         val builtIn = WORDS.filter { it !in removed }
         // wordlist.txt: word -> frequency (uses per word of text), or null if the line had no Zipf value.
         val listed = LinkedHashMap<String, Double?>()
@@ -465,8 +469,9 @@ object WordPredictor {
     private fun vocabIndex(): VocabIndex {
         val current = index
         if (current != null && indexVersion == user.vocabularyVersion) return current
-        val merged = ArrayList<String>(staticWords)
-        for (w in user.addedWordList()) if (!rank.containsKey(w)) merged.add(w)
+        val merged = ArrayList<String>(staticWords.size)
+        for (w in staticWords) if (!user.isBlocked(w)) merged.add(w)
+        for (w in user.addedWordList()) if (!rank.containsKey(w) || user.isBlocked(w)) merged.add(w)
         val sorted = merged.toTypedArray()
         sorted.sort()
         var maxLen = 0
@@ -528,20 +533,89 @@ object WordPredictor {
     /** A real word: in the built-in dictionary, or one the person added. */
     fun isKnown(word: String): Boolean {
         val w = normalize(word)
-        return rank.containsKey(w) || user.isAdded(w)
+        return (rank.containsKey(w) && !user.isBlocked(w)) || user.isAdded(w)
     }
+
+    /** Changes whenever the set of usable words does, so other caches know to refresh. */
+    fun vocabularyStamp(): Int = user.vocabularyVersion
 
     // ---------- the person's own words ----------
 
     /** Adds a word to the person's dictionary. False if it isn't a plain word or is already known. */
     fun addWord(word: String): Boolean {
         val w = normalize(word.trim())
+        // A dictionary word the person took out just goes back in.
+        if (user.isBlocked(w) && rank.containsKey(w)) return unblockWord(w)
         if (!isLearnable(w) || isTrusted(w)) return false
         return user.addWord(w)
     }
 
     /** Removes a word the person added. Built-in words can't be removed. */
     fun removeWord(word: String): Boolean = user.removeWord(normalize(word.trim()))
+
+    /**
+     * Takes any word out of the keyboard, built-in or added: it is never
+     * suggested, never used as an autocorrection, and what was learned
+     * about it is wiped. [unblockWord] (or adding it again) puts it back.
+     */
+    fun blockWord(word: String): Boolean {
+        val w = normalize(word.trim())
+        if (w.isEmpty()) return false
+        if (!rank.containsKey(w) && !user.isAdded(w)) return false
+        val changed = user.blockWord(w)
+        if (changed) index = null
+        return changed
+    }
+
+    fun unblockWord(word: String): Boolean {
+        val changed = user.unblockWord(normalize(word.trim()))
+        if (changed) index = null
+        return changed
+    }
+
+    fun blockedWords(): List<String> = user.blockedWordList()
+
+    /** Everything the keyboard knows about one word, for the lookup box in settings. */
+    class WordStatus(
+        val word: String,
+        /** In the app's built-in word lists. */
+        val inDictionary: Boolean,
+        /** Place in the frequency list (1 = most common), if it has one. */
+        val rank: Int?,
+        val zipf: Double?,
+        val added: Boolean,
+        /** Taken out by the person. */
+        val blocked: Boolean,
+        /** Taken out by the app's own junk-word list. */
+        val removedByApp: Boolean,
+        /** Roughly how often the person has typed it (recent typing counts most). */
+        val timesTyped: Float,
+        /** What the keyboard changes it to when space is pressed, if anything. */
+        val correction: String?,
+        /** Real words close to it (when it isn't one). */
+        val near: List<String>,
+        val plain: Boolean
+    )
+
+    fun lookup(word: String): WordStatus {
+        val w = normalize(word.trim())
+        val inDict = rank.containsKey(w)
+        val r = rank[w]
+        val known = isKnown(w)
+        return WordStatus(
+            word = w,
+            inDictionary = inDict,
+            rank = if (inDict && r != null && staticFreq != null && r < staticWords.size) r + 1 else null,
+            zipf = if (inDict) zipfOf(w) else null,
+            added = user.isAdded(w),
+            blocked = user.isBlocked(w),
+            removedByApp = w in removedWords,
+            timesTyped = user.unigramCount(w),
+            correction = if (w.length >= 2) Autocorrector.correctionFor(w) else null,
+            near = if (known) emptyList() else Autocorrector.nearMatches(w),
+            plain = isLearnable(w)
+        )
+    }
 
     fun addedWords(): List<String> = user.addedWordList()
 
