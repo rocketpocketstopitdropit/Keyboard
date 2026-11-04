@@ -81,6 +81,17 @@ class MyKeyboardIME : InputMethodService() {
     private var pendingCorrection: Pair<String, String>? = null
     private var pendingCorrectionPrev: String = ""
     private var autocorrectSuppressedWord: String? = null
+    /** What came right after the corrected word: the space, or the punctuation mark that ended it. */
+    private var pendingCorrectionTail = " "
+    /**
+     * Words the person undid a correction for ("em" put back after it became
+     * "en"). They're left as typed from then on while the keyboard is running,
+     * and are never added to the dictionary.
+     */
+    private val keepAsTyped = HashSet<String>()
+    /** Recent automatic changes, corrected word -> what was typed, so editing one back counts as undoing it. */
+    private val recentFixes = LinkedHashMap<String, String>()
+    private var enterHoldRunnable: Runnable? = null
     private var learningAllowed = true
     private var autocorrectAllowed = true
 
@@ -1213,6 +1224,7 @@ class MyKeyboardIME : InputMethodService() {
             }
             KeyAction.SPACE -> if (spaceBarMovesCursor && !gifMode && !wordMode) scheduleSpaceHold(id)
             KeyAction.CURSOR -> state.cursorPad = true
+            KeyAction.ENTER -> scheduleEnterHold(id)
             else -> {}
         }
     }
@@ -1246,6 +1258,11 @@ class MyKeyboardIME : InputMethodService() {
         val dy = y - state.downY
         // A flick up on the space bar accepts the dimmed prediction in the suggestion bar.
         if (dy <= -dp(24) && abs(dy) > abs(dx)) {
+            // The bar waits for a pause in typing; make sure it matches every letter typed so far.
+            if (currentWord.isNotEmpty()) {
+                uiHandler.removeCallbacks(predictionRunnable)
+                updatePredictionNow()
+            }
             val word = acceptWord
             if (word != null) {
                 state.spaceGesture = true
@@ -1285,6 +1302,7 @@ class MyKeyboardIME : InputMethodService() {
         holdRunnable?.let { uiHandler.removeCallbacks(it) }
         holdRunnable = null
         val key = state.key ?: return
+        if (key.config.action == KeyAction.ENTER) cancelEnterHold()
         // A finger that landed earlier but is still down gets typed first, so
         // letters always come out in the order they were pressed ("an", not "na").
         if (!state.backspace && !state.consumed && !state.spaceGesture && !state.cursorPad) {
@@ -1307,6 +1325,7 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun cancelAllTouches() {
         stopRepeating()
+        cancelEnterHold()
         repeatOwner = -1
         holdRunnable?.let { uiHandler.removeCallbacks(it) }
         holdRunnable = null
@@ -1520,17 +1539,12 @@ class MyKeyboardIME : InputMethodService() {
             lastCharWordish = false
             val pending = pendingCorrection
             pendingCorrection = null
-            if (pending != null) {
-                val (original, corrected) = pending
-                ic.deleteSurroundingText(corrected.length + 1, 0)
-                ic.commitText(original, 1)
-                currentWord.clear()
-                currentWord.append(original)
-                autocorrectSuppressedWord = original
-                // Undo what was learned from the correction, and go back to the
-                // word that came before the one being retyped.
-                if (learningAllowed) WordPredictor.unlearn(pendingCorrectionPrev, corrected)
-                previousWord = pendingCorrectionPrev
+            // Only undo if the corrected word (and the space or mark after it) is
+            // really what sits behind the cursor; otherwise this is a plain backspace.
+            if (pending != null && selStart == selEnd &&
+                textEndsWithWord(ic, pending.second, pendingCorrectionTail)
+            ) {
+                undoCorrection(ic, pending, keepTail = false)
             } else {
                 // selStart/selEnd are kept current by onUpdateSelection, so there's no
                 // blocking question to the app on every backspace.
@@ -1544,7 +1558,12 @@ class MyKeyboardIME : InputMethodService() {
                 }
                 // Backing into the word before (or out of one): read it back from the text,
                 // so predictions use exactly the letters between the last space and the cursor.
-                if (currentWord.isEmpty()) readTextState(ic)?.let { applyTextState(it) }
+                if (currentWord.isEmpty()) {
+                    readTextState(ic)?.let { applyTextState(it) }
+                    // Backing into a word the keyboard changed means the change was
+                    // wrong: what was originally typed is left alone from now on.
+                    recentFixes[currentWord.toString().lowercase()]?.let { keepAsTyped.add(it) }
+                }
             }
             updatePrediction()
             return
@@ -1557,15 +1576,7 @@ class MyKeyboardIME : InputMethodService() {
         }
 
         when (config.action) {
-            KeyAction.ENTER -> {
-                finishWord(currentWord.toString(), 1f)
-                pressEnter(ic)
-                previousWord = WordPredictor.START
-                sentenceEndPending = false
-                lastCharWordish = false
-                // A capital after the new line only if the line ended a sentence.
-                readTextState(ic)?.let { applyTextState(it) }
-            }
+            KeyAction.ENTER -> finishEnter(ic, sendAction = false)
             KeyAction.SHIFT -> {
                 // Turning off a shift the keyboard turned on means "lowercase here".
                 if (shiftIsAuto && shiftState == ShiftState.ONCE) autoCapCancelled = true
@@ -1622,22 +1633,21 @@ class MyKeyboardIME : InputMethodService() {
                 // The person just undid a correction for this exact word: leave it
                 // alone now, and remember it strongly so it isn't "fixed" again.
                 val rejected = typed.isNotEmpty() && typed == suppressed
-                val endsWithApostrophe = typed.isNotEmpty() && isApostrophe(typed.last())
-                val correction = if (typed.isEmpty() || rejected || endsWithApostrophe || !autocorrectAllowed ||
-                    wordAfterDigit
-                ) {
+                val correction = if (!mayAutocorrect(typed) || rejected) {
                     null
                 } else {
                     correctionFor(typed)?.let { matchCase(typed, it) }
                         // Splitting a word in the middle: leave the front half as typed.
                         ?.takeUnless { letterAfterCursor(ic) }
+                        // Never touch anything but exactly the word being typed.
+                        ?.takeIf { safeToReplace(ic, typed) }
                 }
                 if (correction != null) {
+                    ic.beginBatchEdit()
                     ic.deleteSurroundingText(typed.length, 0)
-                    ic.commitText(correction, 1)
-                    ic.commitText(" ", 1)
-                    pendingCorrection = typed to correction
-                    pendingCorrectionPrev = previousWord
+                    ic.commitText("$correction ", 1)
+                    ic.endBatchEdit()
+                    rememberFix(typed, correction, " ")
                     autoSpaced = true
                 } else {
                     ic.commitText(" ", 1)
@@ -1670,7 +1680,7 @@ class MyKeyboardIME : InputMethodService() {
                 ) {
                     text = text.uppercase()
                 }
-                val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic) else null
+                val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic, text) else null
                 if (fixed != null) {
                     currentWord.setLength(0)
                     currentWord.append(fixed)
@@ -1708,8 +1718,12 @@ class MyKeyboardIME : InputMethodService() {
      * (texts, emails, notes), so it never sends a message by surprise; use
      * the app's own send button. In one-line boxes (search, web address) it
      * does what the box asks for: search, go, next, done, send.
+     *
+     * [sendAction] (holding the key down) is the traditional Enter in every
+     * box: the box's own action (search, send, go...) if it has one, otherwise
+     * a real Enter key press, which web pages treat as "submit".
      */
-    private fun pressEnter(ic: InputConnection) {
+    private fun pressEnter(ic: InputConnection, sendAction: Boolean) {
         val info = currentInputEditorInfo
         val type = info?.inputType ?: 0
         val options = info?.imeOptions ?: 0
@@ -1717,14 +1731,132 @@ class MyKeyboardIME : InputMethodService() {
         val multiLine = isText && (type and (InputType.TYPE_TEXT_FLAG_MULTI_LINE or
                 InputType.TYPE_TEXT_FLAG_IME_MULTI_LINE)) != 0
         val action = options and EditorInfo.IME_MASK_ACTION
+        val hasAction = action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED
         val noEnterAction = (options and EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0
         when {
+            sendAction -> if (!hasAction || !ic.performEditorAction(action)) {
+                sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+            }
             multiLine -> ic.commitText("\n", 1)
-            !noEnterAction && action != EditorInfo.IME_ACTION_NONE &&
-                    action != EditorInfo.IME_ACTION_UNSPECIFIED -> ic.performEditorAction(action)
-            else -> {
-                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER))
-                ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER))
+            !noEnterAction && hasAction -> ic.performEditorAction(action)
+            else -> sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
+        }
+    }
+
+    private fun finishEnter(ic: InputConnection, sendAction: Boolean) {
+        finishWord(currentWord.toString(), 1f)
+        pressEnter(ic, sendAction)
+        previousWord = WordPredictor.START
+        sentenceEndPending = false
+        lastCharWordish = false
+        // A capital after the new line only if the line ended a sentence.
+        readTextState(ic)?.let { applyTextState(it) }
+    }
+
+    /** Holding the Enter / new-line key for a moment presses the traditional Enter instead. */
+    private fun scheduleEnterHold(id: Int) {
+        cancelEnterHold()
+        if (gifMode || wordMode) return
+        val r = Runnable {
+            enterHoldRunnable = null
+            val state = touches.get(id) ?: return@Runnable
+            if (state.consumed || state.key?.config?.action != KeyAction.ENTER) return@Runnable
+            state.consumed = true
+            state.key?.setPressedVisual(false)
+            vibrateKey()
+            val ic = currentInputConnection ?: return@Runnable
+            lastKeyTime = SystemClock.uptimeMillis()
+            clearAutoSpace()
+            pendingCorrection = null
+            spaceAfterWord = false
+            lastWasSpace = false
+            finishEnter(ic, sendAction = true)
+            updatePrediction()
+        }
+        enterHoldRunnable = r
+        uiHandler.postDelayed(r, ENTER_HOLD_MS)
+    }
+
+    private fun cancelEnterHold() {
+        enterHoldRunnable?.let { uiHandler.removeCallbacks(it) }
+        enterHoldRunnable = null
+    }
+
+    /** Whether the word being typed may be autocorrected at all. */
+    private fun mayAutocorrect(typed: String): Boolean =
+        typed.isNotEmpty() && !isApostrophe(typed.last()) && autocorrectAllowed && !wordAfterDigit &&
+                WordPredictor.normalize(typed) !in keepAsTyped
+
+    /**
+     * True when the text right before the cursor is exactly [word] followed by
+     * [tail], and the word starts at a word boundary. Every replacement checks
+     * this first, so a word that's out of step with the text can never delete
+     * spaces or eat into the words before it.
+     */
+    private fun textEndsWithWord(ic: InputConnection, word: String, tail: String = ""): Boolean {
+        val want = word + tail
+        val before = ic.getTextBeforeCursor(want.length + 1, 0)?.toString() ?: return false
+        if (!before.endsWith(want)) return false
+        return before.length == want.length || !before[before.length - want.length - 1].isLetterOrDigit()
+    }
+
+    /**
+     * Whether an autocorrection may replace [typed]: it has to be exactly
+     * what's behind the cursor, and a word that starts with an apostrophe
+     * ('em, 'til, 'cause) is a deliberate short form, so it's left alone.
+     */
+    private fun safeToReplace(ic: InputConnection, typed: String): Boolean {
+        if (selStart != selEnd || !textEndsWithWord(ic, typed)) return false
+        val before = ic.getTextBeforeCursor(typed.length + 1, 0) ?: return false
+        return before.length == typed.length || !isApostrophe(before[0])
+    }
+
+    /** Remember an automatic change so backspace or the ↶ suggestion can undo it. */
+    private fun rememberFix(typed: String, corrected: String, tail: String) {
+        pendingCorrection = typed to corrected
+        pendingCorrectionPrev = previousWord
+        pendingCorrectionTail = tail
+        recentFixes.remove(corrected.lowercase())
+        recentFixes[corrected.lowercase()] = WordPredictor.normalize(typed)
+        while (recentFixes.size > 30) recentFixes.remove(recentFixes.keys.first())
+    }
+
+    /**
+     * Put back exactly what was typed. From backspace ([keepTail] false) the
+     * space or mark after the word goes too and the cursor ends up right after
+     * the restored word; from the ↶ suggestion everything after it stays.
+     * Either way the word is left alone from now on, without being added to
+     * the dictionary.
+     */
+    private fun undoCorrection(ic: InputConnection, pending: Pair<String, String>, keepTail: Boolean) {
+        val (original, corrected) = pending
+        val tail = pendingCorrectionTail
+        ic.beginBatchEdit()
+        ic.deleteSurroundingText(corrected.length + tail.length, 0)
+        ic.commitText(if (keepTail) original + tail else original, 1)
+        ic.endBatchEdit()
+        pendingCorrection = null
+        keepAsTyped.add(WordPredictor.normalize(original))
+        recentFixes.remove(corrected.lowercase())
+        if (learningAllowed) WordPredictor.unlearn(pendingCorrectionPrev, corrected)
+        clearAutoSpace()
+        spaceAfterWord = false
+        lastWasSpace = false
+        sentenceEndPending = false
+        if (keepTail) {
+            currentWord.clear()
+            readTextState(ic)?.let { applyTextState(it) }
+        } else {
+            // Back to typing the restored word, after the word that came before it.
+            currentWord.setLength(0)
+            currentWord.append(original)
+            autocorrectSuppressedWord = original
+            previousWord = pendingCorrectionPrev
+            lastCharWordish = true
+            if (shiftIsAuto && shiftState == ShiftState.ONCE) {
+                shiftState = ShiftState.OFF
+                shiftIsAuto = false
+                refreshLabels()
             }
         }
     }
@@ -1749,7 +1881,7 @@ class MyKeyboardIME : InputMethodService() {
         if (attachPunctuation(ic, text)) return
         clearAutoSpace()
         pendingCorrection = null
-        val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic) else null
+        val fixed = if (isPunctuation(text)) correctBeforePunctuation(ic, text) else null
         ic.commitText(text, 1)
         finishWord(fixed ?: currentWord.toString(), 1f)
         val endsSentence = text.length == 1 && (text[0] == '.' || text[0] == '!' || text[0] == '?')
@@ -1822,18 +1954,18 @@ class MyKeyboardIME : InputMethodService() {
      * space bar), so "rhe." becomes "the.". Returns the corrected word, or null
      * if it was left alone. Backspace right after undoes it, like with space.
      */
-    private fun correctBeforePunctuation(ic: InputConnection): String? {
+    private fun correctBeforePunctuation(ic: InputConnection, mark: String): String? {
         val typed = currentWord.toString()
         val suppressed = autocorrectSuppressedWord
         autocorrectSuppressedWord = null
-        if (typed.isEmpty() || typed == suppressed || isApostrophe(typed.last()) || !autocorrectAllowed ||
-            wordAfterDigit
-        ) return null
+        if (!mayAutocorrect(typed) || typed == suppressed) return null
         val correction = correctionFor(typed)?.let { matchCase(typed, it) } ?: return null
+        if (letterAfterCursor(ic) || !safeToReplace(ic, typed)) return null
+        ic.beginBatchEdit()
         ic.deleteSurroundingText(typed.length, 0)
         ic.commitText(correction, 1)
-        pendingCorrection = typed to correction
-        pendingCorrectionPrev = previousWord
+        ic.endBatchEdit()
+        rememberFix(typed, correction, mark)
         return correction
     }
 
@@ -2058,6 +2190,19 @@ class MyKeyboardIME : InputMethodService() {
         val strip = suggestionStrip ?: return
         val typed = currentWord.toString()
 
+        // Right after an autocorrection or an accepted prediction, offer to put back what was typed.
+        val undo = pendingCorrection
+        if (typed.isEmpty() && undo != null && autocorrectAllowed && suggestionViews.size >= 3) {
+            acceptWord = null
+            suggestionViews[0].text = UNDO_MARK + undo.first
+            suggestionViews[0].setTypeface(null, Typeface.NORMAL)
+            suggestionViews[1].text = ""
+            suggestionViews[2].text = ""
+            if (!suggestionsSeparate) icons.visibility = View.GONE
+            strip.visibility = View.VISIBLE
+            return
+        }
+
         if (typed.isEmpty() || !autocorrectAllowed || suggestionViews.size < 3) {
             acceptWord = null
             if (suggestionsSeparate) {
@@ -2090,6 +2235,15 @@ class MyKeyboardIME : InputMethodService() {
     /** Replace the word being typed with a tapped suggestion, then add a space. */
     private fun onSuggestionTapped(text: String) {
         val ic = currentInputConnection ?: return
+        if (text.startsWith(UNDO_MARK)) {
+            val pending = pendingCorrection
+            if (pending != null && textEndsWithWord(ic, pending.second, pendingCorrectionTail)) {
+                undoCorrection(ic, pending, keepTail = true)
+            }
+            pendingCorrection = null
+            updatePrediction()
+            return
+        }
         val typed = currentWord.toString()
         if (typed.isEmpty() || text.isEmpty()) return
 
@@ -2098,17 +2252,30 @@ class MyKeyboardIME : InputMethodService() {
         val word = if (isLiteral) text.substring(1, text.length - 1) else text
 
         if (word != typed) {
+            // The word being typed has to be exactly what's behind the cursor, or
+            // the swap would eat a space or part of the word before. If it's out
+            // of step, re-read it from the text and let the bar catch up instead.
+            if (selStart != selEnd || !textEndsWithWord(ic, typed)) {
+                readTextState(ic)?.let { applyTextState(it) }
+                updatePrediction()
+                return
+            }
+            ic.beginBatchEdit()
             ic.deleteSurroundingText(typed.length, 0)
             ic.commitText("$word ", 1)
+            ic.endBatchEdit()
         } else {
             ic.commitText(" ", 1)
         }
         if (isLiteral && WordPredictor.addWord(word)) {
             Toast.makeText(this, "Added \"" + word + "\" to your words.", Toast.LENGTH_SHORT).show()
         }
-        // Backspace right after undoes the swap, just like an autocorrection.
-        pendingCorrection = if (word != typed) typed to word else null
-        pendingCorrectionPrev = previousWord
+        // Backspace right after (or the ↶ suggestion) undoes the swap, just like an autocorrection.
+        if (word != typed) {
+            rememberFix(typed, word, " ")
+        } else {
+            pendingCorrection = null
+        }
         autocorrectSuppressedWord = null
         corrTyped = null
         acceptWord = null
@@ -2188,6 +2355,7 @@ class MyKeyboardIME : InputMethodService() {
         exitWordMode()
         currentWord.clear()
         pendingCorrection = null
+        pendingCorrectionTail = " "
         autocorrectSuppressedWord = null
         previousWord = WordPredictor.START
         spaceAfterWord = false
@@ -2267,6 +2435,10 @@ class MyKeyboardIME : InputMethodService() {
         const val VOICE_SILENCE_MS = 3000L
         /** ...or this long after tapping the mic if nothing is said at all. */
         const val VOICE_FIRST_WORD_MS = 5000L
+        /** Holding the new-line key this long presses the traditional Enter (search, send, go). */
+        const val ENTER_HOLD_MS = 600L
+        /** Starts the suggestion that puts back what was typed before an autocorrection. */
+        const val UNDO_MARK = "\u21B6 "
     }
 
     private fun dp(value: Int): Int =
