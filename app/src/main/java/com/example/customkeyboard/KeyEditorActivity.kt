@@ -251,7 +251,7 @@ class KeyEditorActivity : Activity() {
             val related = LinkedHashSet<String>()
             correction?.let { related.add(WordPredictor.normalize(it)) }
             for (w in bar.words) related.add(WordPredictor.normalize(w))
-            if (!st.usable) for (w in Autocorrector.nearMatches(st.word)) related.add(w)
+            if (!st.usable) for (w in Autocorrector.nearMatches(st.word).orEmpty()) related.add(w)
             related.remove(st.word)
             for (w in related) {
                 chipsRow.addView(Button(this).apply {

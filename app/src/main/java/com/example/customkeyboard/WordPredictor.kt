@@ -493,6 +493,13 @@ object WordPredictor {
         return built
     }
 
+    /**
+     * Every usable word, bucketed by length. A new set of lists is made whenever
+     * the vocabulary changes and handed-out lists are never changed, so the
+     * autocorrector can read them from its background thread.
+     */
+    fun lengthBuckets(): Array<List<String>> = vocabIndex().byLength
+
     /** Every usable word that is exactly [length] letters long. */
     fun wordsOfLength(length: Int): List<String> {
         val idx = vocabIndex()
@@ -886,15 +893,32 @@ object WordPredictor {
         val p = normalize(prefix)
         val idx = vocabIndex()
         val ctx = contextFor(previousWord)
-        val scored = ArrayList<Pair<String, Double>>()
+        if (count <= 0) return emptyList()
+        // Keep just the best [count] as we go: a short prefix matches thousands of
+        // words, and collecting and sorting all of them on every key was wasted work.
+        // Ties keep the earlier (alphabetical) word, as the old stable sort did.
+        val bestWords = arrayOfNulls<String>(count)
+        val bestScores = DoubleArray(count)
+        var filled = 0
         var i = firstWithPrefix(idx, p)
         while (i < idx.sorted.size && idx.sorted[i].startsWith(p)) {
             val w = idx.sorted[i]
-            scored.add(w to probability(w, ctx))
             i++
+            val pr = probability(w, ctx)
+            if (filled == count && pr <= bestScores[count - 1]) continue
+            var at = if (filled < count) filled else count - 1
+            while (at > 0 && bestScores[at - 1] < pr) {
+                bestWords[at] = bestWords[at - 1]
+                bestScores[at] = bestScores[at - 1]
+                at--
+            }
+            bestWords[at] = w
+            bestScores[at] = pr
+            if (filled < count) filled++
         }
-        scored.sortByDescending { it.second }
-        return scored.take(count).map { it.first }
+        val out = ArrayList<String>(filled)
+        for (k in 0 until filled) out.add(bestWords[k]!!)
+        return out
     }
 
     private var firstLetterPrev: String? = null
@@ -902,6 +926,15 @@ object WordPredictor {
     private var firstLetterVocab = -1
     private var firstLetterTables: NgramTables? = null
     private var firstLetterCache: Map<Char, Double> = emptyMap()
+
+    // The last answer for a part-typed word. One key press asks for it two or
+    // three times (touch model, highlight, overlapping fingers).
+    private var lastLetterPrev: String? = null
+    private var lastLetterPrefix: String? = null
+    private var lastLetterData = -1
+    private var lastLetterVocab = -1
+    private var lastLetterTables: NgramTables? = null
+    private var lastLetterResult: Map<Char, Double> = emptyMap()
 
     /**
      * How likely each next letter (a-z) is after [prefix], judged by adding up
@@ -919,9 +952,15 @@ object WordPredictor {
         ) {
             return firstLetterCache
         }
+        if (p.isNotEmpty() && lastLetterPrefix == p && lastLetterPrev == prev &&
+            lastLetterData == user.dataVersion && lastLetterVocab == user.vocabularyVersion &&
+            lastLetterTables === tables
+        ) {
+            return lastLetterResult
+        }
         val idx = vocabIndex()
         val ctx = contextFor(previousWord)
-        val mass = HashMap<Char, Double>()
+        val mass = DoubleArray(26)
         var total = 0.0
         var i = if (p.isEmpty()) 0 else firstWithPrefix(idx, p)
         while (i < idx.sorted.size) {
@@ -933,10 +972,23 @@ object WordPredictor {
             if (c < 'a' || c > 'z') continue
             val pr = probability(w, ctx)
             total += pr
-            mass[c] = (mass[c] ?: 0.0) + pr
+            mass[c - 'a'] += pr
         }
-        val result: Map<Char, Double> = if (total <= 0.0) emptyMap() else mass.mapValues { it.value / total }
-        if (p.isEmpty()) {
+        val result: Map<Char, Double> = if (total <= 0.0) {
+            emptyMap()
+        } else {
+            val m = LinkedHashMap<Char, Double>()
+            for (k in 0 until 26) if (mass[k] > 0.0) m['a' + k] = mass[k] / total
+            m
+        }
+        if (p.isNotEmpty()) {
+            lastLetterPrev = prev
+            lastLetterPrefix = p
+            lastLetterData = user.dataVersion
+            lastLetterVocab = user.vocabularyVersion
+            lastLetterTables = tables
+            lastLetterResult = result
+        } else {
             firstLetterPrev = prev
             firstLetterData = user.dataVersion
             firstLetterVocab = user.vocabularyVersion

@@ -1,5 +1,10 @@
 package com.example.customkeyboard
 
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
+import java.util.concurrent.FutureTask
 import kotlin.math.abs
 
 /**
@@ -66,7 +71,17 @@ object Autocorrector {
         val c = DoubleArray(size)
     }
 
-    private fun substitutionCost(typed: Char, intended: Char): Double {
+    /**
+     * Cost of typing [typed] where [intended] was meant, for every pair of
+     * plain ASCII characters, worked out once. The distance loop runs this
+     * hundreds of thousands of times per word, and a map lookup there was
+     * most of the cost.
+     */
+    private val SUB_COST: Array<DoubleArray> = Array(128) { t ->
+        DoubleArray(128) { i -> slowSubstitutionCost(t.toChar(), i.toChar()) }
+    }
+
+    private fun slowSubstitutionCost(typed: Char, intended: Char): Double {
         if (typed == intended) return 0.0
         val a = POSITIONS[typed]
         val b = POSITIONS[intended]
@@ -74,6 +89,12 @@ object Autocorrector {
             val dist = abs(a.first - b.first) + abs(a.second - b.second)
             if (dist <= 1) return NEIGHBOUR_COST
         }
+        return 1.0
+    }
+
+    private fun substitutionCost(typed: Char, intended: Char): Double {
+        if (typed == intended) return 0.0
+        if (typed.code < 128 && intended.code < 128) return SUB_COST[typed.code][intended.code]
         return 1.0
     }
 
@@ -159,59 +180,77 @@ object Autocorrector {
      * word of the same length that is hundreds of times more common and
      * reached by a single slip onto a neighbouring key or a swapped pair. The
      * very rarest also allow two neighbour slips ("abf" -> "and").
+     * The Boolean is false when [wait] is false and the search isn't finished yet.
      */
-    private fun rareWordCorrection(lower: String, zipf: Double, previousWord: String): String? {
-        if (lower.length < 3) return null
-        val minZipf = maxOf(zipf + RARE_GAP, RARE_MIN_TARGET)
+    private fun rareWordCorrection(lower: String, zipf: Double, previousWord: String, wait: Boolean): Pair<String?, Boolean> {
+        if (lower.length < 3) return null to true
+        val cands = candidates(Job.RARE, lower, zipf, wait) ?: return null to false
         val prior = WordPredictor.priorScorer(previousWord)
-        val ws = Workspace(lower.length + 3)
         var best: String? = null
         var bestScore = Double.MAX_VALUE
-        for (candidate in WordPredictor.wordsOfLength(lower.length)) {
+        // Candidates arrive in the dictionary's order, so ties go to the more common word, as before.
+        for (c in cands) {
+            val score = c.distance - PRIOR_WEIGHT * prior(c.word)
+            if (score < bestScore) {
+                bestScore = score
+                best = c.word
+            }
+        }
+        return best to true
+    }
+
+    /** The slow part of [rareWordCorrection]: which common words are one slip away. Runs off the main thread. */
+    private fun rareCandidates(lower: String, zipf: Double, buckets: Array<List<String>>): List<Cand> {
+        val minZipf = maxOf(zipf + RARE_GAP, RARE_MIN_TARGET)
+        val ws = Workspace(lower.length + 3)
+        val out = ArrayList<Cand>()
+        val bucket = if (lower.length < buckets.size) buckets[lower.length] else return out
+        for (candidate in bucket) {
             val cz = WordPredictor.zipfOf(candidate) ?: continue
             if (cz < minZipf) continue
             val d = typoDistance(lower, candidate, TRANSPOSE_COST + 0.05, ws)
             val ok = d <= NEIGHBOUR_COST + 0.05 ||
                     (d <= TRANSPOSE_COST + 0.05 && (zipf < VERY_RARE_ZIPF || isSwap(lower, candidate)))
-            if (!ok) continue
-            val score = d - PRIOR_WEIGHT * prior(candidate)
-            if (score < bestScore) {
-                bestScore = score
-                best = candidate
-            }
+            if (ok) out.add(Cand(candidate, d))
         }
-        return best
+        return out
     }
 
     /**
      * The correction for [typedWord] (typed after [previousWord]), or null
-     * to leave it alone.
+     * to leave it alone. With [wait] false this never holds up the caller:
+     * if the search isn't finished it returns null and [onReady] fires once
+     * it is.
      */
-    fun correctionFor(typedWord: String, previousWord: String = ""): String? {
+    fun correctionFor(typedWord: String, previousWord: String = "", wait: Boolean = true): String? =
+        correction(typedWord, previousWord, wait).first
+
+    private fun correction(typedWord: String, previousWord: String, wait: Boolean): Pair<String?, Boolean> {
         // A lone lowercase "i" is always the pronoun.
-        if (typedWord == "i") return "I"
+        if (typedWord == "i") return "I" to true
 
         val lower = WordPredictor.normalize(typedWord)
-        if (lower.length < 2) return null
+        if (lower.length < 2) return null to true
 
         // "i'm" -> "I'm" (checked before the known-word test, since "i'm" is a known word)
-        if (typedWord[0] == 'i' && lower in I_CONTRACTIONS) return "I" + typedWord.substring(1)
+        if (typedWord[0] == 'i' && lower in I_CONTRACTIONS) return ("I" + typedWord.substring(1)) to true
 
         if (WordPredictor.isKnown(lower)) {
             // Rare entries in the big word list include everyday slips ("rhe",
             // "abd", "yoy"), so a rare word still gets fixed when a far more
             // common word is one slip away.
-            val zipf = WordPredictor.rareZipfOf(lower) ?: return null
-            return rareWordCorrection(lower, zipf, previousWord)
+            val zipf = WordPredictor.rareZipfOf(lower) ?: return null to true
+            return rareWordCorrection(lower, zipf, previousWord, wait)
         }
 
         // Possessives and "'s" contractions ("john's") are almost never typos.
-        if (lower.endsWith("'s")) return null
+        if (lower.endsWith("'s")) return null to true
 
-        CONTRACTIONS[lower]?.let { return it }
+        CONTRACTIONS[lower]?.let { return it to true }
 
-        val best = nearWords(lower, previousWord).firstOrNull() ?: return null
-        return if (best != lower) best else null
+        val near = nearWords(lower, previousWord, wait) ?: return null to false
+        val best = near.firstOrNull() ?: return null to true
+        return (if (best != lower) best else null) to true
     }
 
     private var nearTyped: String? = null
@@ -223,33 +262,23 @@ object Autocorrector {
      * Real words close to an unknown typed word, best first (at most
      * [NEAR_COUNT]). The first one is the autocorrection; the rest can fill
      * the suggestion bar when nothing starts with what was typed.
+     * With [wait] false, null means "still searching".
      */
-    fun nearMatches(typedWord: String, previousWord: String = ""): List<String> {
+    fun nearMatches(typedWord: String, previousWord: String = "", wait: Boolean = true): List<String>? {
         val lower = WordPredictor.normalize(typedWord)
         if (lower.length < 2 || WordPredictor.isKnown(lower)) return emptyList()
-        return nearWords(lower, previousWord)
+        return nearWords(lower, previousWord, wait)
     }
 
-    private fun nearWords(lower: String, previousWord: String): List<String> {
+    private fun nearWords(lower: String, previousWord: String, wait: Boolean): List<String>? {
         val stamp = WordPredictor.vocabularyStamp()
         if (nearTyped == lower && nearPrev == previousWord && nearStamp == stamp) return nearResult
-        val limit = limitFor(lower.length)
+        val cands = candidates(Job.NEAR, lower, 0.0, wait) ?: return null
         val prior = WordPredictor.priorScorer(previousWord)
-        val ws = Workspace(lower.length + 4)
-        // The cheapest a missing or extra letter can be is DOUBLED_COST, which bounds the length gap.
-        val gap = minOf(2, (limit / DOUBLED_COST).toInt())
-        val found = ArrayList<Pair<String, Double>>()
-        for (length in (lower.length - gap)..(lower.length + gap)) {
-            if (length < 1) continue
-            val farLength = abs(length - lower.length) >= 2
-            for (candidate in WordPredictor.wordsOfLength(length)) {
-                if (farLength && candidate[0] != lower[0]) continue
-                val d = typoDistance(lower, candidate, limit, ws)
-                if (d > limit) continue
-                if (d > SAME_START_ABOVE && candidate[0] != lower[0]) continue
-                found.add(candidate to d - PRIOR_WEIGHT * prior(candidate))
-            }
-        }
+        // Candidates come in the same order the old single-thread search found them
+        // (shortest first, then by how common), and the sort is stable, so ties land the same way.
+        val found = ArrayList<Pair<String, Double>>(cands.size)
+        for (c in cands) found.add(c.word to c.distance - PRIOR_WEIGHT * prior(c.word))
         found.sortBy { it.second }
         val result = found.take(NEAR_COUNT).map { it.first }
         nearTyped = lower
@@ -257,6 +286,99 @@ object Autocorrector {
         nearStamp = stamp
         nearResult = result
         return result
+    }
+
+    /** The slow part of [nearWords]: every real word within reach of the typed one. Runs off the main thread. */
+    private fun nearCandidates(lower: String, buckets: Array<List<String>>): List<Cand> {
+        val limit = limitFor(lower.length)
+        val ws = Workspace(lower.length + 4)
+        // The cheapest a missing or extra letter can be is DOUBLED_COST, which bounds the length gap.
+        val gap = minOf(2, (limit / DOUBLED_COST).toInt())
+        // A word that starts with a different letter must come in under SAME_START_ABOVE,
+        // so the distance search can give up on it that much sooner.
+        val otherStartLimit = minOf(limit, SAME_START_ABOVE)
+        val found = ArrayList<Cand>()
+        for (length in (lower.length - gap)..(lower.length + gap)) {
+            if (length < 1 || length >= buckets.size) continue
+            val farLength = abs(length - lower.length) >= 2
+            for (candidate in buckets[length]) {
+                val sameStart = candidate[0] == lower[0]
+                if (farLength && !sameStart) continue
+                val cap = if (sameStart) limit else otherStartLimit
+                val d = typoDistance(lower, candidate, cap, ws)
+                if (d > cap) continue
+                found.add(Cand(candidate, d))
+            }
+        }
+        return found
+    }
+
+    // ---------- the background search ----------
+
+    private class Cand(val word: String, val distance: Double)
+
+    private object Job {
+        const val NEAR = 'n'
+        const val RARE = 'r'
+    }
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    /**
+     * Called on the main thread when a search started with wait = false
+     * finishes, so the suggestion bar can fill in the correction.
+     */
+    var onReady: (() -> Unit)? = null
+
+    private val worker = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "autocorrect").apply { isDaemon = true }
+    }
+
+    private class Search(work: Callable<List<Cand>>) : FutureTask<List<Cand>>(work) {
+        override fun done() {
+            if (!isCancelled) mainHandler.post { onReady?.invoke() }
+        }
+    }
+
+    /** Recent searches, newest last. Touched only on the main thread. */
+    private val searches = LinkedHashMap<String, Search>()
+
+    /**
+     * The words within reach of [lower], searched on a background thread so
+     * typing never waits on it. Searches for letters typed since are
+     * dropped if they haven't started. With [wait] true the caller waits for
+     * whatever is left of the search (space and punctuation need the
+     * answer); otherwise null means "not ready yet".
+     */
+    private fun candidates(kind: Char, lower: String, zipf: Double, wait: Boolean): List<Cand>? {
+        val key = "$kind|${WordPredictor.vocabularyStamp()}|$lower"
+        var search = searches[key]
+        if (search == null || search.isCancelled) {
+            // A newer word makes any search that hasn't started yet pointless.
+            val it = searches.values.iterator()
+            while (it.hasNext()) {
+                val s = it.next()
+                if (!s.isDone) {
+                    s.cancel(false)
+                    it.remove()
+                }
+            }
+            val buckets = WordPredictor.lengthBuckets()
+            val created = Search(Callable {
+                if (kind == Job.RARE) rareCandidates(lower, zipf, buckets) else nearCandidates(lower, buckets)
+            })
+            searches[key] = created
+            while (searches.size > 8) searches.remove(searches.keys.first())
+            search = created
+            worker.execute(created)
+        }
+        if (!wait && !search.isDone) return null
+        return try {
+            search.get()
+        } catch (e: Exception) {
+            searches.remove(key)
+            emptyList()
+        }
     }
 
     private const val NEAR_COUNT = 4
@@ -273,9 +395,9 @@ object Autocorrector {
      * corrected) it also appears on the left in quotes, to keep it as typed.
      * [shape] matches each word to the typed capitals.
      */
-    fun bar(typed: String, previousWord: String, shape: (String) -> String = { it }): Bar {
+    fun bar(typed: String, previousWord: String, wait: Boolean = true, shape: (String) -> String = { it }): Bar {
         val words = ArrayList<String>()
-        val correction = correctionFor(typed, previousWord)
+        val correction = correctionFor(typed, previousWord, wait)
         correction?.let { words.add(shape(it)) }
         fun offer(w: String) {
             val shown = shape(w)
@@ -284,7 +406,7 @@ object Autocorrector {
         for (w in WordPredictor.suggestions(previousWord, typed, 4)) offer(w)
         // Nothing (or little) starts with a mistyped word, so offer the closest real words too.
         if (words.size < 3) {
-            for (w in nearMatches(typed, previousWord)) {
+            for (w in nearMatches(typed, previousWord, wait) ?: emptyList()) {
                 offer(w)
                 if (words.size >= 3) break
             }

@@ -196,12 +196,15 @@ class MyKeyboardIME : InputMethodService() {
         super.onCreate()
         WordPredictor.init(this)
         clipboardManager.addPrimaryClipChangedListener(clipListener)
+        // The autocorrect search runs in the background; fill in the bar when it lands.
+        Autocorrector.onReady = { if (currentWord.isNotEmpty()) updateSuggestions() }
     }
 
     override fun onDestroy() {
         super.onDestroy()
         clipboardManager.removePrimaryClipChangedListener(clipListener)
         speechRecognizer?.destroy()
+        Autocorrector.onReady = null
     }
 
     override fun onCreateInputView(): View {
@@ -985,14 +988,43 @@ class MyKeyboardIME : InputMethodService() {
             // also restarts it after each stretch of speech (see onResults).
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, VOICE_SILENCE_MS)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, VOICE_SILENCE_MS)
+            // Android 13+: one long session that hands over each stretch of speech as it
+            // goes and only ends after three quiet seconds. Restarting the recognizer after
+            // every pause instead (the fallback below) makes it play its start and stop
+            // sounds each time, so the "done" sound went off over and over.
+            if (Build.VERSION.SDK_INT >= 33) {
+                putExtra(
+                    RecognizerIntent.EXTRA_SEGMENTED_SESSION,
+                    RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS
+                )
+            }
         }
+        var gotSegments = false
         recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(results: Bundle?) {
+            override fun onSegmentResults(segmentResults: Bundle) {
                 if (speechRecognizer !== recognizer) return
-                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                gotSegments = true
+                val text = segmentResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
                 if (!text.isNullOrBlank()) {
                     commitSpokenText(text)
                     heardSpeech()
+                }
+            }
+            override fun onEndOfSegmentedSession() {
+                if (speechRecognizer !== recognizer) return
+                stopListening()
+            }
+            override fun onResults(results: Bundle?) {
+                if (speechRecognizer !== recognizer) return
+                val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+                // In a segmented session the words already went in segment by segment.
+                if (!text.isNullOrBlank() && !gotSegments) {
+                    commitSpokenText(text)
+                    heardSpeech()
+                }
+                if (gotSegments) {
+                    stopListening()
+                    return
                 }
                 // The recognizer stops at the first short pause. Keep listening until
                 // three seconds have passed since the last word.
@@ -1261,7 +1293,7 @@ class MyKeyboardIME : InputMethodService() {
             // The bar waits for a pause in typing; make sure it matches every letter typed so far.
             if (currentWord.isNotEmpty()) {
                 uiHandler.removeCallbacks(predictionRunnable)
-                updatePredictionNow()
+                updatePredictionNow(waitForCorrection = true)
             }
             val word = acceptWord
             if (word != null) {
@@ -1806,9 +1838,13 @@ class MyKeyboardIME : InputMethodService() {
      * ('em, 'til, 'cause) is a deliberate short form, so it's left alone.
      */
     private fun safeToReplace(ic: InputConnection, typed: String): Boolean {
-        if (selStart != selEnd || !textEndsWithWord(ic, typed)) return false
-        val before = ic.getTextBeforeCursor(typed.length + 1, 0) ?: return false
-        return before.length == typed.length || !isApostrophe(before[0])
+        if (selStart != selEnd) return false
+        // One trip to the app for both checks: each one makes typing wait on the app.
+        val before = ic.getTextBeforeCursor(typed.length + 1, 0)?.toString() ?: return false
+        if (!before.endsWith(typed)) return false
+        if (before.length == typed.length) return true
+        val charBefore = before[before.length - typed.length - 1]
+        return !charBefore.isLetterOrDigit() && !isApostrophe(charBefore)
     }
 
     /** Remember an automatic change so backspace or the ↶ suggestion can undo it. */
@@ -2183,8 +2219,12 @@ class MyKeyboardIME : InputMethodService() {
      * dimmed; a flick up on the space bar accepts it. If the word being typed
      * isn't a real word, it also appears on the left in quotes: tapping that
      * keeps it as typed and adds it to your own words.
+     *
+     * [waitForCorrection] false (while typing) never holds up the keys: if the
+     * autocorrect search for this word is still running, the bar shows what it
+     * has and fills in the correction when the search finishes.
      */
-    private fun updateSuggestions() {
+    private fun updateSuggestions(waitForCorrection: Boolean = false) {
         if (gifMode || wordMode) return
         val icons = iconStrip ?: return
         val strip = suggestionStrip ?: return
@@ -2215,7 +2255,7 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
 
-        val bar = Autocorrector.bar(typed, previousWord) { matchCase(typed, it) }
+        val bar = Autocorrector.bar(typed, previousWord, wait = waitForCorrection) { matchCase(typed, it) }
         val best = bar.best
         val left: CharSequence? = bar.left
         val centre: CharSequence? = if (best != null && bar.centre == best) ghostText(best, typed) else bar.centre
@@ -2311,6 +2351,11 @@ class MyKeyboardIME : InputMethodService() {
     /** The touch model updates right away; the suggestion bar can wait for a pause in typing. */
     private fun updatePrediction() {
         refreshLetterPrior()
+        // Start the autocorrect search now, in the background, so it's usually
+        // finished by the time the bar updates or space is pressed.
+        if (currentWord.isNotEmpty() && autocorrectAllowed && !gifMode && !wordMode) {
+            Autocorrector.correctionFor(currentWord.toString(), previousWord, wait = false)
+        }
         uiHandler.removeCallbacks(predictionRunnable)
         uiHandler.postDelayed(predictionRunnable, predictionDelayMs)
     }
@@ -2332,8 +2377,8 @@ class MyKeyboardIME : InputMethodService() {
         readTextState(ic)?.let { applyTextState(it) }
     }
 
-    private fun updatePredictionNow() {
-        updateSuggestions()
+    private fun updatePredictionNow(waitForCorrection: Boolean = false) {
+        updateSuggestions(waitForCorrection)
         predictedKeyView?.isPredicted = false
         predictedKeyView = null
 
