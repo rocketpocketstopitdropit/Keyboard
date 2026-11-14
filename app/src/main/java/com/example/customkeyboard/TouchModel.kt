@@ -104,9 +104,9 @@ class TouchModel {
     }
 
     companion object {
-        private const val SEED_WEIGHT = 8
-        private const val MIN_RATE = 0.04f
-        private const val MAX_OFFSET = 0.6f
+        private const val SEED_WEIGHT = 4
+        private const val MIN_RATE = 0.06f
+        private const val MAX_OFFSET = 1.0f
         private const val MAX_SAMPLE = 1.2f
 
         /**

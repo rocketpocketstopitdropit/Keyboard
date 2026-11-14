@@ -20,6 +20,9 @@ object Autocorrector {
 
     private val ROWS = listOf("qwertyuiop", "asdfghjkl", "zxcvbnm")
 
+    /** How far each row of letters is shifted to the right of the top row, in key widths. */
+    private val ROW_SHIFT = doubleArrayOf(0.0, 0.5, 1.5)
+
     private val POSITIONS: Map<Char, Pair<Int, Int>> = HashMap<Char, Pair<Int, Int>>().also { map ->
         ROWS.forEachIndexed { row, chars ->
             chars.forEachIndexed { col, ch -> map[ch] = row to col }
@@ -85,11 +88,64 @@ object Autocorrector {
         if (typed == intended) return 0.0
         val a = POSITIONS[typed]
         val b = POSITIONS[intended]
-        if (a != null && b != null) {
-            val dist = abs(a.first - b.first) + abs(a.second - b.second)
-            if (dist <= 1) return NEIGHBOUR_COST
-        }
+        if (a != null && b != null && areNeighbours(a, b)) return NEIGHBOUR_COST
         return 1.0
+    }
+
+    /**
+     * Keys that touch on a real keyboard, where each row is shifted sideways:
+     * the keys either side in the same row, and the keys above and below that
+     * overlap this one or sit diagonally next to it (K is above M, and L is
+     * below both O and P). A finger that lands low or high hits these.
+     */
+    private fun areNeighbours(a: Pair<Int, Int>, b: Pair<Int, Int>): Boolean {
+        val rows = abs(a.first - b.first)
+        if (rows > 1) return false
+        val across = abs((a.second + ROW_SHIFT[a.first]) - (b.second + ROW_SHIFT[b.first]))
+        return across <= 1.0
+    }
+
+    // ---------- letters typed at almost the same instant ----------
+
+    private var doubtWord: String? = null
+    private var doubtPairs: IntArray = IntArray(0)
+
+    /**
+     * The keyboard says that in [word], the letter at each position in
+     * [pairs] and the one after it landed within a few hundredths of a second
+     * of each other. With two thumbs that close together, which one touched
+     * first is down to chance, so the two letters may be the wrong way round.
+     */
+    fun setOrderDoubt(word: String, pairs: IntArray) {
+        doubtWord = WordPredictor.normalize(word)
+        doubtPairs = pairs
+    }
+
+    /**
+     * If what was typed isn't a word (or is a very rare one) and swapping one
+     * of those nearly-simultaneous pairs makes a normal word ("nad" -> "and",
+     * "cnat" -> "can't"), that is what was meant.
+     */
+    private fun orderDoubtFix(lower: String): String? {
+        if (doubtPairs.isEmpty() || doubtWord != lower) return null
+        if (WordPredictor.isKnown(lower) && WordPredictor.rareZipfOf(lower) == null) return null
+        var best: String? = null
+        var bestZipf = -1.0
+        for (i in doubtPairs) {
+            if (i < 0 || i + 1 >= lower.length || lower[i] == lower[i + 1]) continue
+            val swapped = lower.substring(0, i) + lower[i + 1] + lower[i] + lower.substring(i + 2)
+            val word = when {
+                WordPredictor.isKnown(swapped) ->
+                    if (WordPredictor.rareZipfOf(swapped) == null) swapped else null
+                else -> CONTRACTIONS[swapped]
+            } ?: continue
+            val zipf = WordPredictor.zipfOf(word) ?: 0.0
+            if (zipf > bestZipf) {
+                bestZipf = zipf
+                best = word
+            }
+        }
+        return best
     }
 
     private fun substitutionCost(typed: Char, intended: Char): Double {
@@ -234,6 +290,9 @@ object Autocorrector {
 
         // "i'm" -> "I'm" (checked before the known-word test, since "i'm" is a known word)
         if (typedWord[0] == 'i' && lower in I_CONTRACTIONS) return ("I" + typedWord.substring(1)) to true
+
+        // Two letters typed at almost the same instant may simply be the wrong way round.
+        orderDoubtFix(lower)?.let { return it to true }
 
         if (WordPredictor.isKnown(lower)) {
             // Rare entries in the big word list include everyday slips ("rhe",

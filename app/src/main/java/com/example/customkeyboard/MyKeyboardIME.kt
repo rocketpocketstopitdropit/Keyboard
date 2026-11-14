@@ -53,6 +53,7 @@ private const val TOUCH_SIGMA = 0.4
 private const val MAX_TOUCH_D2 = 1.0
 private const val PRIOR_FLOOR = 0.02
 private const val TOUCH_PREFS = "touch_model"
+private const val ORDER_DOUBT_MS = 70L
 
 class MyKeyboardIME : InputMethodService() {
 
@@ -146,25 +147,45 @@ class MyKeyboardIME : InputMethodService() {
 
     /** Where the finger landed for each letter of the word being typed (null = not typed by a tap). */
     private val wordTouches = ArrayList<FloatArray?>()
+    /** When each of those fingers came down (0 = unknown). */
+    private val wordTimes = ArrayList<Long>()
     private var tapX = Float.NaN
     private var tapY = Float.NaN
+    private var tapTime = 0L
 
     /** Finishes a touch as a tap or flick, noting where it landed so the touch model can learn from it. */
     private fun typeTouch(t: TouchState, x: Float, y: Float) {
         val key = t.key ?: return
         tapX = t.downX
         tapY = t.downY
+        tapTime = t.downAt
         try {
             key.resolveGesture(x - t.downX, y - t.downY)
         } finally {
             tapX = Float.NaN
+            tapTime = 0L
         }
     }
 
     /** A letter was just added to the word being typed; keep its touch alongside it. */
     private fun noteLetterTouch() {
-        if (currentWord.length <= 1 || wordTouches.size > 48) wordTouches.clear()
+        if (currentWord.length <= 1 || wordTouches.size > 48) {
+            wordTouches.clear()
+            wordTimes.clear()
+        }
         wordTouches.add(if (tapX.isNaN()) null else floatArrayOf(tapX, tapY))
+        wordTimes.add(tapTime)
+        // Two thumbs landing within a few hundredths of a second: which came first is
+        // down to chance, so tell the autocorrector those two letters may be swapped.
+        if (wordTimes.size == currentWord.length) {
+            var pairs = IntArray(0)
+            for (i in 0 until wordTimes.size - 1) {
+                val a = wordTimes[i]
+                val b = wordTimes[i + 1]
+                if (a > 0L && b > 0L && abs(b - a) <= ORDER_DOUBT_MS) pairs += i
+            }
+            Autocorrector.setOrderDoubt(currentWord.toString(), pairs)
+        }
     }
 
     /**
@@ -184,6 +205,11 @@ class MyKeyboardIME : InputMethodService() {
                 for (i in typed.indices) {
                     val touch = wordTouches[i] ?: continue
                     val c = finalWord[i].lowercaseChar()
+                    // Two letters that were only swapped round say nothing about where the finger lands.
+                    if (c != typed[i].lowercaseChar() && (
+                            (i > 0 && c == typed[i - 1].lowercaseChar()) ||
+                            (i + 1 < typed.length && c == typed[i + 1].lowercaseChar()))
+                    ) continue
                     val lr = letterRects.firstOrNull { it.letter == c } ?: continue
                     val w = lr.rect.width()
                     val h = lr.rect.height()
@@ -1826,6 +1852,7 @@ class MyKeyboardIME : InputMethodService() {
                     ic.deleteSurroundingText(1, 0)
                     if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
                     if (wordTouches.isNotEmpty()) wordTouches.removeAt(wordTouches.size - 1)
+                    if (wordTimes.isNotEmpty()) wordTimes.removeAt(wordTimes.size - 1)
                 }
                 // Backing into the word before (or out of one): read it back from the text,
                 // so predictions use exactly the letters between the last space and the cursor.

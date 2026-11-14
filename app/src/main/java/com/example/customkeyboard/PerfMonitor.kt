@@ -28,7 +28,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon3"
+    const val BUILD = "mon4"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
