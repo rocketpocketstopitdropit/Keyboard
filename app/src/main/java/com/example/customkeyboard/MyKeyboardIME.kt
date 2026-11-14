@@ -130,7 +130,7 @@ class MyKeyboardIME : InputMethodService() {
     private val predictionDelayMs = 40L
 
     // Learned counts are saved during a pause in typing, never between keystrokes.
-    private val flushRunnable = Runnable { WordPredictor.flush() }
+    private val flushRunnable = Runnable { PerfMonitor.span("saveLearned") { WordPredictor.flush() } }
 
     private fun scheduleFlush() {
         uiHandler.removeCallbacks(flushRunnable)
@@ -152,7 +152,7 @@ class MyKeyboardIME : InputMethodService() {
 
     private fun correctionFor(typed: String): String? {
         if (corrTyped == typed && corrPrev == previousWord) return corrResult
-        val result = Autocorrector.correctionFor(typed, previousWord)
+        val result = PerfMonitor.span("correction") { Autocorrector.correctionFor(typed, previousWord) }
         corrTyped = typed
         corrPrev = previousWord
         corrResult = result
@@ -197,7 +197,7 @@ class MyKeyboardIME : InputMethodService() {
         WordPredictor.init(this)
         clipboardManager.addPrimaryClipChangedListener(clipListener)
         // The autocorrect search runs in the background; fill in the bar when it lands.
-        Autocorrector.onReady = { if (currentWord.isNotEmpty()) updateSuggestions() }
+        Autocorrector.onReady = { if (currentWord.isNotEmpty()) PerfMonitor.span("barRefresh") { updateSuggestions() } }
     }
 
     override fun onDestroy() {
@@ -207,13 +207,34 @@ class MyKeyboardIME : InputMethodService() {
         Autocorrector.onReady = null
     }
 
+    /** Every call into the app goes through the typing monitor's stopwatch. */
+    override fun getCurrentInputConnection(): InputConnection? =
+        super.getCurrentInputConnection()?.let { PerfMonitor.wrap(it) }
+
+    /** Holding the gear pastes the typing monitor's report into the text box (and copies it). */
+    private fun pasteTypingReport() {
+        val report = PerfMonitor.report(this, currentInputEditorInfo?.packageName)
+        try {
+            clipboardManager.setPrimaryClip(android.content.ClipData.newPlainText("Typing report", report))
+        } catch (e: Exception) {
+            // The paste below still works.
+        }
+        currentInputConnection?.commitText(report, 1)
+        currentWord.clear()
+        pendingCorrection = null
+        PerfMonitor.reset()
+        Toast.makeText(this, "Typing report pasted. Recording starts over now.", Toast.LENGTH_SHORT).show()
+    }
+
     override fun onCreateInputView(): View {
         keyboardContainer = FrameLayout(this)
         populateKeyboard()
         return keyboardContainer
     }
 
-    private fun populateKeyboard() {
+    private fun populateKeyboard() = PerfMonitor.span("rebuildKeyboard") { buildKeyboardNow() }
+
+    private fun buildKeyboardNow() {
         stopRepeating()
         keyboardContainer.removeAllViews()
         predictedKeyView = null
@@ -227,6 +248,14 @@ class MyKeyboardIME : InputMethodService() {
             onTap = { cfg -> handleTap(cfg) },
             onFlick = { _, alt -> commitDirect(alt) },
             onAccessory = { action -> handleAccessory(action) },
+            onAccessoryHold = { action ->
+                if (action == AccessoryAction.SETTINGS) {
+                    pasteTypingReport()
+                    true
+                } else {
+                    false
+                }
+            },
             onSuggestion = { word -> onSuggestionTapped(word) },
             onStripFlickUp = { if (!wordMode) enterWordMode() }
         )
@@ -1142,7 +1171,9 @@ class MyKeyboardIME : InputMethodService() {
             config.label.uppercase()
         else config.label
     }
-    private fun refreshLabels() {
+    private fun refreshLabels() = PerfMonitor.span("relabelKeys") { refreshLabelsNow() }
+
+    private fun refreshLabelsNow() {
         for (kv in allKeys) {
             val cfg = kv.config
             when (cfg.action) {
@@ -1193,20 +1224,34 @@ class MyKeyboardIME : InputMethodService() {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
+                PerfMonitor.begin('D', event.eventTime)
                 pointerDown(event.getPointerId(i), event.getX(i), event.getY(i))
+                PerfMonitor.end()
             }
             MotionEvent.ACTION_MOVE -> {
+                PerfMonitor.move(event.eventTime)
                 for (i in 0 until event.pointerCount) {
                     pointerMove(event.getPointerId(i), event.getX(i), event.getY(i))
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
                 val i = event.actionIndex
+                PerfMonitor.begin('U', event.eventTime)
+                PerfMonitor.label(monitorLabel(touches.get(event.getPointerId(i))?.key))
                 pointerUp(event.getPointerId(i), event.getX(i), event.getY(i))
+                PerfMonitor.end()
             }
             MotionEvent.ACTION_CANCEL -> cancelAllTouches()
         }
         return true
+    }
+
+    /** What the typing monitor calls a key. Nothing is named in boxes the keyboard doesn't learn from (passwords). */
+    private fun monitorLabel(key: KeyView?): String = when {
+        key == null -> "none"
+        !learningAllowed -> "*"
+        key.config.action == KeyAction.CHAR -> key.config.label
+        else -> key.config.action.name.lowercase()
     }
 
     /** Letter keys still held down, oldest first: typed, but not yet committed. */
@@ -1241,9 +1286,10 @@ class MyKeyboardIME : InputMethodService() {
         }
         val state = TouchState(target, x, y, ++touchSeq)
         touches.put(id, state)
+        PerfMonitor.label(monitorLabel(target))
         if (target == null) return
         target.setPressedVisual(true)
-        vibrateKey()
+        PerfMonitor.span("vibrate") { vibrateKey() }
         when (target.config.action) {
             KeyAction.BACKSPACE -> {
                 state.backspace = true
@@ -1546,7 +1592,9 @@ class MyKeyboardIME : InputMethodService() {
         else -> correction
     }
 
-    private fun handleTap(config: KeyConfig) {
+    private fun handleTap(config: KeyConfig) = PerfMonitor.span("tap") { handleTapNow(config) }
+
+    private fun handleTapNow(config: KeyConfig) {
         // The cursor key does its work while being dragged; a plain tap types nothing.
         if (config.action == KeyAction.CURSOR) return
         if (gifMode && handleGifKey(config)) return
@@ -2114,7 +2162,9 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     /** After a pause: if the cursor moved or the text changed underneath, re-read the word. */
-    private fun resyncFromText() {
+    private fun resyncFromText() = PerfMonitor.span("resync") { resyncNow() }
+
+    private fun resyncNow() {
         if (gifMode || wordMode || selStart != selEnd) return
         val waited = SystemClock.uptimeMillis() - lastKeyTime
         if (waited < RESYNC_DELAY_MS) {
@@ -2149,7 +2199,7 @@ class MyKeyboardIME : InputMethodService() {
         val bare = word.trimEnd('\'', '\u2019')
         if (bare.isNotEmpty()) {
             if (learningAllowed) {
-                WordPredictor.learn(previousWord, bare, weight)
+                PerfMonitor.span("learn") { WordPredictor.learn(previousWord, bare, weight) }
                 scheduleFlush()
             }
             previousWord = WordPredictor.pushContext(previousWord, bare)
@@ -2350,11 +2400,13 @@ class MyKeyboardIME : InputMethodService() {
 
     /** The touch model updates right away; the suggestion bar can wait for a pause in typing. */
     private fun updatePrediction() {
-        refreshLetterPrior()
+        PerfMonitor.span("letterOdds") { refreshLetterPrior() }
         // Start the autocorrect search now, in the background, so it's usually
         // finished by the time the bar updates or space is pressed.
         if (currentWord.isNotEmpty() && autocorrectAllowed && !gifMode && !wordMode) {
-            Autocorrector.correctionFor(currentWord.toString(), previousWord, wait = false)
+            PerfMonitor.span("startSearch") {
+                Autocorrector.correctionFor(currentWord.toString(), previousWord, wait = false)
+            }
         }
         uiHandler.removeCallbacks(predictionRunnable)
         uiHandler.postDelayed(predictionRunnable, predictionDelayMs)
@@ -2378,11 +2430,13 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun updatePredictionNow(waitForCorrection: Boolean = false) {
-        updateSuggestions(waitForCorrection)
+        PerfMonitor.span("bar") { updateSuggestions(waitForCorrection) }
         predictedKeyView?.isPredicted = false
         predictedKeyView = null
 
-        val guess = LetterPredictor.predictNext(previousWord, currentWord.toString()) ?: return
+        val guess = PerfMonitor.span("nextKey") {
+            LetterPredictor.predictNext(previousWord, currentWord.toString())
+        } ?: return
         if (guess == ' ') return
 
         val target = letterKeys.firstOrNull { key ->
@@ -2424,6 +2478,7 @@ class MyKeyboardIME : InputMethodService() {
         refreshAutoCap()
         refreshLetterPrior()
         updateSuggestions()
+        PerfMonitor.start(window?.window)
     }
 
     override fun onUpdateSelection(
@@ -2434,6 +2489,7 @@ class MyKeyboardIME : InputMethodService() {
         super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd)
         selStart = newSelStart
         selEnd = newSelEnd
+        PerfMonitor.echoEnd()
         uiHandler.removeCallbacks(resyncRunnable)
         uiHandler.postDelayed(resyncRunnable, RESYNC_DELAY_MS)
     }
@@ -2446,6 +2502,7 @@ class MyKeyboardIME : InputMethodService() {
         uiHandler.removeCallbacks(resyncRunnable)
         stopListening()
         WordPredictor.flush()
+        PerfMonitor.stop()
     }
 
     private fun loadHaptics() {

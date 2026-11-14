@@ -198,6 +198,8 @@ object KeyboardBuilder {
         onTap: (KeyConfig) -> Unit,
         onFlick: (KeyConfig, String) -> Unit,
         onAccessory: (AccessoryAction) -> Unit,
+        /** A hotkey was held down. Return true if that did something. */
+        onAccessoryHold: (AccessoryAction) -> Boolean = { false },
         onSuggestion: (String) -> Unit = {},
         /** A flick up on the suggestion area (opens the word checker). */
         onStripFlickUp: () -> Unit = {},
@@ -300,6 +302,7 @@ object KeyboardBuilder {
                 gravity = Gravity.CENTER
                 setTextColor(iconColor)
                 setOnClickListener { onAccessory(action) }
+                setOnLongClickListener { onAccessoryHold(action) }
             }
 
         val iconStrip = LinearLayout(context).apply {
