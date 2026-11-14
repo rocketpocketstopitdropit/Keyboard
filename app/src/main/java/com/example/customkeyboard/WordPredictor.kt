@@ -299,6 +299,9 @@ object WordPredictor {
         user.retainWords { it == START || isKnown(it) }
         index = null
         loadNgramsInBackground(app)
+        // Work out the per-letter totals now, while the keyboard opens, rather than
+        // on the first key press.
+        letterTotals(vocabIndex())
     }
 
     private fun loadNgramsInBackground(context: Context) {
@@ -894,31 +897,22 @@ object WordPredictor {
         val idx = vocabIndex()
         val ctx = contextFor(previousWord)
         if (count <= 0) return emptyList()
-        // Keep just the best [count] as we go: a short prefix matches thousands of
-        // words, and collecting and sorting all of them on every key was wasted work.
-        // Ties keep the earlier (alphabetical) word, as the old stable sort did.
-        val bestWords = arrayOfNulls<String>(count)
-        val bestScores = DoubleArray(count)
-        var filled = 0
-        var i = firstWithPrefix(idx, p)
-        while (i < idx.sorted.size && idx.sorted[i].startsWith(p)) {
-            val w = idx.sorted[i]
-            i++
-            val pr = probability(w, ctx)
-            if (filled == count && pr <= bestScores[count - 1]) continue
-            var at = if (filled < count) filled else count - 1
-            while (at > 0 && bestScores[at - 1] < pr) {
-                bestWords[at] = bestWords[at - 1]
-                bestScores[at] = bestScores[at - 1]
-                at--
-            }
-            bestWords[at] = w
-            bestScores[at] = pr
-            if (filled < count) filled++
+        // One letter in, thousands of words match; see [oneLetterSuggestions].
+        if (p.length == 1 && p[0] in 'a'..'z') {
+            oneLetterSuggestions(idx, ctx, p, count)?.let { return it }
         }
-        val out = ArrayList<String>(filled)
-        for (k in 0 until filled) out.add(bestWords[k]!!)
-        return out
+        // Keep just the best [count] as we go. Ties keep the earlier (alphabetical)
+        // word, as the old stable sort did.
+        val start = firstWithPrefix(idx, p)
+        var end = start
+        while (end < idx.sorted.size && idx.sorted[end].startsWith(p)) end++
+        return topWords(object : Iterable<String> {
+            override fun iterator() = object : Iterator<String> {
+                var i = start
+                override fun hasNext() = i < end
+                override fun next() = idx.sorted[i++]
+            }
+        }, ctx, count)
     }
 
     private var firstLetterPrev: String? = null
@@ -962,18 +956,11 @@ object WordPredictor {
         val ctx = contextFor(previousWord)
         val mass = DoubleArray(26)
         var total = 0.0
-        var i = if (p.isEmpty()) 0 else firstWithPrefix(idx, p)
-        while (i < idx.sorted.size) {
-            val w = idx.sorted[i]
-            if (!w.startsWith(p)) break
-            i++
-            if (w.length == p.length) continue
-            val c = w[p.length]
-            if (c < 'a' || c > 'z') continue
-            val pr = probability(w, ctx)
-            total += pr
-            mass[c - 'a'] += pr
-        }
+        // Early in a word thousands of words are still candidates, and scoring them
+        // one by one froze the keyboard for a fifth of a second after every space
+        // (it runs between key presses). Add up the same sums from totals instead.
+        prefixMass(idx, ctx, p, mass)
+        for (k in 0 until 26) total += mass[k]
         val result: Map<Char, Double> = if (total <= 0.0) {
             emptyMap()
         } else {
@@ -996,6 +983,190 @@ object WordPredictor {
             firstLetterCache = result
         }
         return result
+    }
+
+    /**
+     * Totals over the usable words, kept per vocabulary. [cum] is a running
+     * total of general frequency along the sorted word list, so the total for
+     * every word starting with some prefix (one unbroken run of the list) is
+     * one subtraction. [topByLetter] holds, per first letter, the
+     * [TOP_PER_LETTER] most common words; [letterCount] how many words start
+     * with each letter.
+     */
+    private class LetterTotals(
+        val cum: DoubleArray,
+        val topByLetter: Array<Array<String>>,
+        val letterCount: IntArray
+    )
+
+    private const val TOP_PER_LETTER = 64
+
+    private var letterTotals: LetterTotals? = null
+    private var letterTotalsIndex: VocabIndex? = null
+
+    private fun letterTotals(idx: VocabIndex): LetterTotals {
+        val cached = letterTotals
+        if (cached != null && letterTotalsIndex === idx) return cached
+        val words = idx.sorted
+        val cum = DoubleArray(words.size + 1)
+        val letterCount = IntArray(26)
+        // Most common words first; equally common ones alphabetically, which is how
+        // the suggestion search breaks ties.
+        val order = Comparator<Pair<String, Double>> { a, b ->
+            val c = b.second.compareTo(a.second)
+            if (c != 0) c else a.first.compareTo(b.first)
+        }
+        val heaps = Array(26) { java.util.PriorityQueue<Pair<String, Double>>(TOP_PER_LETTER + 1, order.reversed()) }
+        for ((i, w) in words.withIndex()) {
+            val f = priorFrequency(w)
+            cum[i + 1] = cum[i] + f
+            if (w.isEmpty() || w[0] < 'a' || w[0] > 'z') continue
+            val k = w[0] - 'a'
+            letterCount[k]++
+            val heap = heaps[k]
+            heap.add(w to f)
+            if (heap.size > TOP_PER_LETTER) heap.poll()
+        }
+        val top = Array(26) { k -> heaps[k].sortedWith(order).map { it.first }.toTypedArray() }
+        val built = LetterTotals(cum, top, letterCount)
+        letterTotals = built
+        letterTotalsIndex = idx
+        return built
+    }
+
+    /** True if [word] is one of the usable words (the ones predictions are drawn from). */
+    private fun inVocabulary(idx: VocabIndex, word: String): Boolean {
+        val i = firstWithPrefix(idx, word)
+        return i < idx.sorted.size && idx.sorted[i] == word
+    }
+
+    /**
+     * Adds into [out] (a-z) the summed [probability] of every usable word that
+     * starts with [p] and goes on, grouped by the
+     * letter after [p], without visiting each word. probability() is a
+     * weighted mix of a few parts (general frequency, the person's own counts,
+     * word pairs, word triples, a small floor), so each part's sum per letter
+     * is that part's weight times its per-letter total. Only general frequency
+     * covers every word, and its totals are kept in [letterTotals]; the other
+     * parts only have a few hundred words each.
+     */
+    private fun prefixMass(idx: VocabIndex, ctx: PredictionContext, p: String, out: DoubleArray) {
+        val totals = letterTotals(idx)
+        val at = p.length
+        // Where the run of words starting with p + each letter begins and ends.
+        val bounds = IntArray(27)
+        for (k in 0..26) bounds[k] = firstWithPrefix(idx, p + ('a' + k))
+
+        // The parts that only some words have, summed per next letter.
+        fun sparse(row: Map<String, *>?, value: (String) -> Double): DoubleArray {
+            val sums = DoubleArray(26)
+            if (row == null) return sums
+            for (w in row.keys) {
+                if (w.length <= at || !w.startsWith(p)) continue
+                val c = w[at]
+                if (c < 'a' || c > 'z' || !inVocabulary(idx, w)) continue
+                sums[c - 'a'] += value(w)
+            }
+            return sums
+        }
+        fun count(k: Int) = bounds[k + 1] - bounds[k]
+        fun prior(k: Int) = totals.cum[bounds[k + 1]] - totals.cum[bounds[k]]
+
+        val userFreq = if (ctx.userTotal > 0.0) {
+            sparse(user.unigramView()) { w -> user.unigramCount(w) / ctx.userTotal }
+        } else {
+            DoubleArray(26)
+        }
+        for (k in 0 until 26) out[k] = (1.0 - ctx.alpha) * prior(k) + ctx.alpha * userFreq[k]
+
+        if (ctx.lambda2 > 0.0) {
+            val cur = sparse(ctx.curated) { w -> ctx.curated[w] ?: 0.0 }
+            val corpus = if (ctx.pairRow != null && ctx.pairTotal > 0.0) {
+                sparse(ctx.pairRow) { w -> (ctx.pairRow[w] ?: 0f) / ctx.pairTotal }
+            } else {
+                DoubleArray(26)
+            }
+            val usr = if (ctx.userRow != null && ctx.userRowTotal > 0.0) {
+                sparse(ctx.userRow) { w -> (ctx.userRow[w] ?: 0f) / ctx.userRowTotal }
+            } else {
+                DoubleArray(26)
+            }
+            for (k in 0 until 26) {
+                val general = when {
+                    ctx.pairRow == null -> cur[k]
+                    ctx.curated.isEmpty() -> corpus[k]
+                    else -> (1.0 - CURATED_SHARE) * corpus[k] + CURATED_SHARE * cur[k]
+                }
+                val pair = (1.0 - ctx.beta) * general + ctx.beta * usr[k]
+                out[k] = ctx.lambda2 * pair + (1.0 - ctx.lambda2) * out[k]
+            }
+        }
+
+        if (ctx.lambda3 > 0.0 && ctx.tripleRow != null && ctx.tripleTotal > 0.0) {
+            val triple = sparse(ctx.tripleRow) { w -> (ctx.tripleRow[w] ?: 0f) / ctx.tripleTotal }
+            for (k in 0 until 26) out[k] = ctx.lambda3 * triple[k] + (1.0 - ctx.lambda3) * out[k]
+        }
+
+        for (k in 0 until 26) out[k] += FLOOR * count(k)
+    }
+
+    /**
+     * The best [count] words starting with the single letter [p], without
+     * scoring the thousands that do. A word that isn't in any of the
+     * context's word lists (the person's counts, word pairs, word triples,
+     * the curated pairs) scores the same multiple of its general frequency
+     * as every other such word, so the best of those are among the most
+     * common words for that letter. Score those plus every listed word, and
+     * the answer is the same as scoring them all. Null if it can't be sure.
+     */
+    private fun oneLetterSuggestions(idx: VocabIndex, ctx: PredictionContext, p: String, count: Int): List<String>? {
+        val totals = letterTotals(idx)
+        val k = p[0] - 'a'
+        val top = totals.topByLetter[k]
+        val listed = HashSet<String>()
+        fun collect(row: Map<String, *>?) {
+            if (row == null) return
+            for (w in row.keys) if (w.startsWith(p) && inVocabulary(idx, w)) listed.add(w)
+        }
+        collect(user.unigramView())
+        collect(ctx.curated)
+        collect(ctx.pairRow)
+        collect(ctx.userRow)
+        collect(ctx.tripleRow)
+        // Enough unlisted words among the most common to be sure of the rest?
+        var unlisted = 0
+        for (w in top) if (w !in listed) unlisted++
+        if (unlisted < count && top.size < totals.letterCount[k]) return null
+
+        val candidates = HashSet<String>(listed)
+        for (w in top) candidates.add(w)
+        val ordered = candidates.toTypedArray()
+        ordered.sort() // alphabetical, like the full search, so ties come out the same
+        return topWords(ordered.asIterable(), ctx, count)
+    }
+
+    /** The [count] likeliest of [words] (visited in order; ties keep the earlier one). */
+    private fun topWords(words: Iterable<String>, ctx: PredictionContext, count: Int): List<String> {
+        if (count <= 0) return emptyList()
+        val bestWords = arrayOfNulls<String>(count)
+        val bestScores = DoubleArray(count)
+        var filled = 0
+        for (w in words) {
+            val pr = probability(w, ctx)
+            if (filled == count && pr <= bestScores[count - 1]) continue
+            var at = if (filled < count) filled else count - 1
+            while (at > 0 && bestScores[at - 1] < pr) {
+                bestWords[at] = bestWords[at - 1]
+                bestScores[at] = bestScores[at - 1]
+                at--
+            }
+            bestWords[at] = w
+            bestScores[at] = pr
+            if (filled < count) filled++
+        }
+        val out = ArrayList<String>(filled)
+        for (j in 0 until filled) out.add(bestWords[j]!!)
+        return out
     }
 
     /** The single likeliest next letter, or null when nothing is likely enough to be worth showing. */

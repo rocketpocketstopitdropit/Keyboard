@@ -150,6 +150,9 @@ class UserLanguageModel {
     // ---------- counts ----------
 
     fun unigramCount(word: String): Float = unigrams[word] ?: 0f
+
+    /** Every word's learned count, read-only. Don't hold on to it across a learn(). */
+    fun unigramView(): Map<String, Float> = unigrams
     fun unigramTotal(): Float = unigramTotal
     fun bigramRow(previous: String): Map<String, Float>? = bigrams[previous]
 
