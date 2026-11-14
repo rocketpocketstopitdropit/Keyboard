@@ -28,7 +28,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon1"
+    const val BUILD = "mon2"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
@@ -77,6 +77,39 @@ object PerfMonitor {
     fun label(text: String) {
         current?.label = text
     }
+
+    /** Extra facts about the touch being handled (finger number, where in the key it landed). */
+    fun detail(text: String) {
+        current?.let { it.label = it.label + " " + text }
+    }
+
+    /** Something worth a line of its own between the touches (the system took a touch away, say). */
+    fun note(kind: Char, text: String) {
+        val e = Event(kind, SystemClock.uptimeMillis(), 0)
+        e.label = text
+        e.handledNs = System.nanoTime()
+        if (events.size >= MAX_EVENTS) events.removeAt(0)
+        events.add(e)
+        notes++
+    }
+
+    /**
+     * Where a letter touch landed inside the key that was typed, in percent of
+     * the key's size from its centre (right and down are positive), for the
+     * left and right halves of the keyboard. [moved] = the word guess typed a
+     * different key from the one under the finger.
+     */
+    fun offset(rightSide: Boolean, dxPct: Int, dyPct: Int, moved: Boolean) {
+        val o = if (rightSide) offsetRight else offsetLeft
+        o[0] += dxPct
+        o[1] += dyPct
+        o[2] += 1
+        if (moved) o[3] += 1
+    }
+
+    private val offsetLeft = LongArray(4)
+    private val offsetRight = LongArray(4)
+    private var notes = 0
 
     fun end() {
         val e = current ?: return
@@ -271,6 +304,9 @@ object PerfMonitor {
         busyMs = 0
         echoStartNs = 0
         gcAtStart = gcSnapshot()
+        offsetLeft.fill(0)
+        offsetRight.fill(0)
+        notes = 0
     }
 
     // ---------- the report ----------
@@ -371,7 +407,18 @@ object PerfMonitor {
         sb.append("GC: count +").append(gc[0] - gcAtStart[0]).append(" time +").append(gc[1] - gcAtStart[1])
             .append("ms blocking +").append(gc[2] - gcAtStart[2]).append(" (").append(gc[3] - gcAtStart[3]).append("ms)\n")
 
-        sb.append("TOUCHES (time, D/U, key, wait/work ms, slow steps):\n")
+        fun side(name: String, o: LongArray) {
+            sb.append(name).append(' ')
+            if (o[2] == 0L) sb.append("none") else sb.append("dx ").append(o[0] / o[2]).append(" dy ").append(o[1] / o[2])
+                .append(" (n ").append(o[2]).append(", moved by word guess ").append(o[3]).append(")")
+        }
+        sb.append("LANDING % of key from centre (right+/down+): ")
+        side("left half", offsetLeft)
+        sb.append(" | ")
+        side("right half", offsetRight)
+        sb.append('\n')
+        sb.append("TOUCHES TAKEN AWAY / NOTES: ").append(notes).append('\n')
+        sb.append("TOUCHES (time, D/U/C, key landing%x,y [raw=key under finger] #finger, wait/work ms, slow steps):\n")
         for (e in events.takeLast(220)) {
             sb.append(String.format("%.2f", (e.eventTimeMs - startedMs) / 1000f)).append(' ').append(e.kind).append(' ')
                 .append(e.label).append(' ').append(e.waitMs).append('/').append(fmt(e.workMs.toDouble()))

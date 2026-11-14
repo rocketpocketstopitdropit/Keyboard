@@ -1195,6 +1195,7 @@ class MyKeyboardIME : InputMethodService() {
 
     /** What one finger is doing. Fingers are tracked separately so overlapping taps in fast typing all count. */
     private class TouchState(val key: KeyView?, val downX: Float, val downY: Float, val seq: Long) {
+        val downAt = SystemClock.uptimeMillis()
         /** Where the finger is now (for typing this key early, if a later finger lifts first). */
         var lastX = downX
         var lastY = downY
@@ -1226,6 +1227,10 @@ class MyKeyboardIME : InputMethodService() {
                 val i = event.actionIndex
                 PerfMonitor.begin('D', event.eventTime)
                 pointerDown(event.getPointerId(i), event.getX(i), event.getY(i))
+                PerfMonitor.detail(
+                    "#" + event.getPointerId(i) +
+                        (if (event.actionMasked == MotionEvent.ACTION_DOWN) "" else "+") + "/" + event.pointerCount
+                )
                 PerfMonitor.end()
             }
             MotionEvent.ACTION_MOVE -> {
@@ -1238,12 +1243,69 @@ class MyKeyboardIME : InputMethodService() {
                 val i = event.actionIndex
                 PerfMonitor.begin('U', event.eventTime)
                 PerfMonitor.label(monitorLabel(touches.get(event.getPointerId(i))?.key))
+                PerfMonitor.detail(
+                    "#" + event.getPointerId(i) +
+                        (if (event.actionMasked == MotionEvent.ACTION_UP) "" else "+") +
+                        (if (event.flags and MotionEvent.FLAG_CANCELED != 0) " CANCELED" else "")
+                )
                 pointerUp(event.getPointerId(i), event.getX(i), event.getY(i))
                 PerfMonitor.end()
             }
-            MotionEvent.ACTION_CANCEL -> cancelAllTouches()
+            MotionEvent.ACTION_CANCEL -> {
+                rescueCancelledTouches()
+                cancelAllTouches()
+            }
         }
         return true
+    }
+
+    /**
+     * The system took the touches away (ACTION_CANCEL). If that happens to a
+     * finger that had only just landed on a letter or the space bar and hadn't
+     * moved, it was a key press in fast typing, not a gesture, so type it
+     * instead of losing the letter.
+     */
+    private fun rescueCancelledTouches() {
+        val now = SystemClock.uptimeMillis()
+        val maxMove = dp(12).toFloat()
+        val pending = ArrayList<TouchState>()
+        for (i in 0 until touches.size()) pending.add(touches.valueAt(i))
+        pending.sortBy { it.seq }
+        val ages = StringBuilder()
+        for (t in pending) ages.append(' ').append(monitorLabel(t.key)).append('@').append(now - t.downAt).append("ms")
+        PerfMonitor.note('C', "taken away:" + (if (ages.isEmpty()) " (no touches)" else ages.toString()))
+        for (t in pending) {
+            val key = t.key ?: continue
+            val action = key.config.action
+            if (action != KeyAction.CHAR && action != KeyAction.SPACE) continue
+            if (t.consumed || t.backspace || t.spaceGesture || t.cursorPad) continue
+            val moved = kotlin.math.hypot(t.lastX - t.downX, t.lastY - t.downY)
+            if (now - t.downAt > 300L || moved > maxMove) continue
+            t.consumed = true
+            PerfMonitor.record("rescuedTakenAway", 0.0)
+            key.resolveGesture(t.lastX - t.downX, t.lastY - t.downY)
+        }
+    }
+
+    /** For the typing monitor: where in the typed key the finger landed, and which key was really under it. */
+    private fun touchNote(target: KeyView?, x: Float, y: Float): String {
+        val rects = keyRects ?: return ""
+        if (target == null) return ""
+        var chosen: Rect? = null
+        var raw: KeyView? = null
+        for (e in rects) {
+            if (e.key === target) chosen = e.rect
+            if (raw == null && e.rect.contains(x.toInt(), y.toInt())) raw = e.key
+        }
+        val r = chosen ?: return ""
+        if (r.width() <= 0 || r.height() <= 0) return ""
+        val dx = ((x - r.exactCenterX()) * 100f / r.width()).toInt()
+        val dy = ((y - r.exactCenterY()) * 100f / r.height()).toInt()
+        val moved = raw !== target
+        if (letterOf(target.config) != null) {
+            PerfMonitor.offset(x > (builtRoot?.width ?: 0) / 2f, dx, dy, moved)
+        }
+        return " " + dx + "," + dy + (if (moved) " raw=" + monitorLabel(raw) else "")
     }
 
     /** What the typing monitor calls a key. Nothing is named in boxes the keyboard doesn't learn from (passwords). */
@@ -1267,6 +1329,14 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun pointerDown(id: Int, x: Float, y: Float) {
+        // A new touch in a slot whose last finger was never reported as lifted: that
+        // finger's key press would vanish without a trace, so finish it first.
+        if (touches.get(id) != null) {
+            val stale = touches.get(id)
+            PerfMonitor.note('C', "lift never arrived: " + monitorLabel(stale.key))
+            PerfMonitor.record("rescuedNoLift", 0.0)
+            pointerUp(id, stale.lastX, stale.lastY)
+        }
         // In fast typing the next finger lands before the last one lifts, so that
         // last letter isn't typed yet. Judge this touch as if it were: after "a",
         // N should win over B because of "and", not because of how words start.
@@ -1286,7 +1356,7 @@ class MyKeyboardIME : InputMethodService() {
         }
         val state = TouchState(target, x, y, ++touchSeq)
         touches.put(id, state)
-        PerfMonitor.label(monitorLabel(target))
+        PerfMonitor.label(monitorLabel(target) + touchNote(target, x, y))
         if (target == null) return
         target.setPressedVisual(true)
         PerfMonitor.span("vibrate") { vibrateKey() }
