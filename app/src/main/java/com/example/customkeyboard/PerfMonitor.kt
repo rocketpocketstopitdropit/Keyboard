@@ -100,16 +100,16 @@ object PerfMonitor {
      * different key from the one under the finger.
      */
     fun offset(rightSide: Boolean, dxPct: Int, dyPct: Int, moved: Boolean) {
-        val o = if (rightSide) offsetRight else offsetLeft
-        o[0] += dxPct
-        o[1] += dyPct
-        o[2] += 1
-        if (moved) o[3] += 1
+        val o: LongArray = if (rightSide) offsetRight else offsetLeft
+        o[0] = o[0] + dxPct.toLong()
+        o[1] = o[1] + dyPct.toLong()
+        o[2] = o[2] + 1L
+        if (moved) o[3] = o[3] + 1L
     }
 
-    private val offsetLeft = LongArray(4)
-    private val offsetRight = LongArray(4)
-    private var notes = 0
+    private val offsetLeft: LongArray = LongArray(4)
+    private val offsetRight: LongArray = LongArray(4)
+    private var notes: Int = 0
 
     fun end() {
         val e = current ?: return
