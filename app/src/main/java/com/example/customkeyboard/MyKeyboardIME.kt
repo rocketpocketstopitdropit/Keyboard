@@ -52,6 +52,7 @@ import kotlin.math.abs
 private const val TOUCH_SIGMA = 0.4
 private const val MAX_TOUCH_D2 = 1.0
 private const val PRIOR_FLOOR = 0.02
+private const val TOUCH_PREFS = "touch_model"
 
 class MyKeyboardIME : InputMethodService() {
 
@@ -130,7 +131,110 @@ class MyKeyboardIME : InputMethodService() {
     private val predictionDelayMs = 40L
 
     // Learned counts are saved during a pause in typing, never between keystrokes.
-    private val flushRunnable = Runnable { PerfMonitor.span("saveLearned") { WordPredictor.flush() } }
+    private val flushRunnable = Runnable {
+        PerfMonitor.span("saveLearned") {
+            WordPredictor.flush()
+            saveTouchModel()
+        }
+    }
+
+    // ---------- where the finger really lands ----------
+
+    /** Each letter's learned landing spot (see [TouchModel]), for the layout and screen in use. */
+    private val touchModel = TouchModel()
+    private var touchModelId: String? = null
+
+    /** Where the finger landed for each letter of the word being typed (null = not typed by a tap). */
+    private val wordTouches = ArrayList<FloatArray?>()
+    private var tapX = Float.NaN
+    private var tapY = Float.NaN
+
+    /** Finishes a touch as a tap or flick, noting where it landed so the touch model can learn from it. */
+    private fun typeTouch(t: TouchState, x: Float, y: Float) {
+        val key = t.key ?: return
+        tapX = t.downX
+        tapY = t.downY
+        try {
+            key.resolveGesture(x - t.downX, y - t.downY)
+        } finally {
+            tapX = Float.NaN
+        }
+    }
+
+    /** A letter was just added to the word being typed; keep its touch alongside it. */
+    private fun noteLetterTouch() {
+        if (currentWord.length <= 1 || wordTouches.size > 48) wordTouches.clear()
+        wordTouches.add(if (tapX.isNaN()) null else floatArrayOf(tapX, tapY))
+    }
+
+    /**
+     * The word is finished as [finalWord] (after any autocorrection). If it's
+     * a real word and at most two letters were fixed, each touch was meant for
+     * the letter that ended up in the text, so move that letter's landing spot
+     * toward where the finger actually came down.
+     */
+    private fun learnTouches(finalWord: String) {
+        val typed = currentWord
+        if (learningAllowed && typed.length >= 2 && wordTouches.size == typed.length &&
+            finalWord.length == typed.length && WordPredictor.isKnown(finalWord)
+        ) {
+            var changed = 0
+            for (i in typed.indices) if (!typed[i].equals(finalWord[i], ignoreCase = true)) changed++
+            if (changed <= 2 && changed * 2 <= typed.length) {
+                for (i in typed.indices) {
+                    val touch = wordTouches[i] ?: continue
+                    val c = finalWord[i].lowercaseChar()
+                    val lr = letterRects.firstOrNull { it.letter == c } ?: continue
+                    val w = lr.rect.width()
+                    val h = lr.rect.height()
+                    if (w <= 0 || h <= 0) continue
+                    touchModel.learn(
+                        c,
+                        (touch[0] - lr.rect.exactCenterX()) / w,
+                        (touch[1] - lr.rect.exactCenterY()) / h
+                    )
+                }
+            }
+        }
+        wordTouches.clear()
+    }
+
+    /** Loads the landing spots learned for this layout and screen width; unlearned keys get a starting guess. */
+    private fun prepareTouchModel(root: View, letters: List<LetterRect>) {
+        val widthDp = resources.configuration.screenWidthDp
+        val id = (if (KeyboardPrefs.getSplitLayout(this)) "split" else "original") + "|" + widthDp
+        if (id != touchModelId) {
+            saveTouchModel()
+            touchModel.load(getSharedPreferences(TOUCH_PREFS, MODE_PRIVATE).getString(id, null))
+            touchModelId = id
+        }
+        // The starting guess was measured on a phone-width keyboard; wider ones learn from scratch.
+        if (widthDp >= 600 || letters.isEmpty() || root.width <= 0) return
+        val rowYs = ArrayList<Float>()
+        for (lr in letters.sortedBy { it.rect.exactCenterY() }) {
+            val cy = lr.rect.exactCenterY()
+            if (rowYs.isEmpty() || cy - rowYs[rowYs.size - 1] > lr.rect.height() / 2f) rowYs.add(cy)
+        }
+        val middle = root.width / 2f
+        for (lr in letters) {
+            val w = lr.rect.width()
+            if (w <= 0) continue
+            val cy = lr.rect.exactCenterY()
+            var row = 0
+            for (i in rowYs.indices) if (abs(cy - rowYs[i]) < abs(cy - rowYs[row])) row = i
+            touchModel.seed(
+                lr.letter,
+                TouchModel.seedDx((lr.rect.exactCenterX() - middle) / w),
+                TouchModel.seedDy(row, rowYs.size)
+            )
+        }
+    }
+
+    private fun saveTouchModel() {
+        val id = touchModelId ?: return
+        if (!touchModel.dirty) return
+        getSharedPreferences(TOUCH_PREFS, MODE_PRIVATE).edit().putString(id, touchModel.save()).apply()
+    }
 
     private fun scheduleFlush() {
         uiHandler.removeCallbacks(flushRunnable)
@@ -198,6 +302,9 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.addPrimaryClipChangedListener(clipListener)
         // The autocorrect search runs in the background; fill in the bar when it lands.
         Autocorrector.onReady = { if (currentWord.isNotEmpty()) PerfMonitor.span("barRefresh") { updateSuggestions() } }
+        PerfMonitor.extra = {
+            "TOUCH MODEL " + (touchModelId ?: "-") + " (letter dx,dy % of key / touches learned):" + touchModel.describe()
+        }
     }
 
     override fun onDestroy() {
@@ -205,6 +312,7 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.removePrimaryClipChangedListener(clipListener)
         speechRecognizer?.destroy()
         Autocorrector.onReady = null
+        PerfMonitor.extra = null
     }
 
     /** Every call into the app goes through the typing monitor's stopwatch. */
@@ -1283,7 +1391,7 @@ class MyKeyboardIME : InputMethodService() {
             if (now - t.downAt > 300L || moved > maxMove) continue
             t.consumed = true
             PerfMonitor.record("rescuedTakenAway", 0.0)
-            key.resolveGesture(t.lastX - t.downX, t.lastY - t.downY)
+            typeTouch(t, t.lastX, t.lastY)
         }
     }
 
@@ -1457,7 +1565,7 @@ class MyKeyboardIME : InputMethodService() {
             for (t in heldLetterTouches()) {
                 if (t.seq >= state.seq) break
                 t.consumed = true
-                t.key?.resolveGesture(t.lastX - t.downX, t.lastY - t.downY)
+                typeTouch(t, t.lastX, t.lastY)
             }
         }
         when {
@@ -1467,7 +1575,7 @@ class MyKeyboardIME : InputMethodService() {
                 key.setPressedVisual(false)
                 refreshAutoCap()
             }
-            else -> key.resolveGesture(x - state.downX, y - state.downY)
+            else -> typeTouch(state, x, y)
         }
     }
 
@@ -1600,6 +1708,7 @@ class MyKeyboardIME : InputMethodService() {
         }
         keyRects = rects
         letterRects = letters
+        prepareTouchModel(root, letters)
         return rects
     }
 
@@ -1616,20 +1725,30 @@ class MyKeyboardIME : InputMethodService() {
         }
         // Space, shift, backspace and the rest are exactly where they are drawn.
         if (hit != null && letterOf(hit.config) == null) return hit
+        // A touch in the thin gap just above the space bar is a space (measured: the thumb
+        // lands high on the space bar), not whichever letter happens to be nearest.
+        if (hit == null) {
+            val reach = dp(4 * KeyboardPrefs.getKeySpacing(this)).coerceAtLeast(dp(6))
+            for (entry in rects) {
+                if (entry.key.config.action != KeyAction.SPACE) continue
+                val r = entry.rect
+                if (x >= r.left && x < r.right && y < r.top && y >= r.top - reach) return entry.key
+            }
+        }
         return chooseLetterKey(x, y, hit, prior, priorMax)
     }
 
     /**
      * Picks a letter key from where the finger landed AND which letter the word
-     * model expects next. The finger counts for most: the centre of any key
-     * always types that key. Only near the line between two keys does the
+     * model expects next. The finger counts for most, and it's measured against
+     * where this person's finger usually lands for each key (see [TouchModel]),
+     * not the middle of the key. Only near the line between two keys does the
      * expected letter tip the choice, and the strength setting says how much.
      */
     private fun chooseLetterKey(
         x: Int, y: Int, hit: KeyView?, letterPrior: Map<Char, Double>, letterPriorMax: Double
     ): KeyView? {
         val strength = predictionStrength
-        if (hit != null && (strength <= 0 || letterPriorMax <= 0.0)) return hit
         val weight = 0.7 * strength / 100.0
         var bestKey: KeyView? = null
         var bestScore = -Double.MAX_VALUE
@@ -1637,8 +1756,9 @@ class MyKeyboardIME : InputMethodService() {
             val w = lr.rect.width()
             val h = lr.rect.height()
             if (w <= 0 || h <= 0) continue
-            val dx = (x - lr.rect.exactCenterX()) / w
-            val dy = (y - lr.rect.exactCenterY()) / h
+            // Distance to where this person's finger usually lands for the key, not to its middle.
+            val dx = (x - lr.rect.exactCenterX()) / w - touchModel.offsetX(lr.letter)
+            val dy = (y - lr.rect.exactCenterY()) / h - touchModel.offsetY(lr.letter)
             val d2 = (dx * dx + dy * dy).toDouble()
             if (d2 > MAX_TOUCH_D2) continue
             var score = -d2 / (2.0 * TOUCH_SIGMA * TOUCH_SIGMA)
@@ -1705,6 +1825,7 @@ class MyKeyboardIME : InputMethodService() {
                 } else {
                     ic.deleteSurroundingText(1, 0)
                     if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
+                    if (wordTouches.isNotEmpty()) wordTouches.removeAt(wordTouches.size - 1)
                 }
                 // Backing into the word before (or out of one): read it back from the text,
                 // so predictions use exactly the letters between the last space and the cursor.
@@ -1843,6 +1964,7 @@ class MyKeyboardIME : InputMethodService() {
                 if (isLetter || isInnerApostrophe) {
                     if (isLetter && currentWord.isEmpty()) wordAfterDigit = lastCharWordish && lastCharDigit
                     currentWord.append(text)
+                    noteLetterTouch()
                 } else {
                     finishWord(currentWord.toString(), 1f)
                     if (text.length == 1 && (text[0] == '.' || text[0] == '!' || text[0] == '?')) {
@@ -2274,6 +2396,7 @@ class MyKeyboardIME : InputMethodService() {
             }
             previousWord = WordPredictor.pushContext(previousWord, bare)
         }
+        learnTouches(word)
         currentWord.clear()
         wordAfterDigit = false
     }
@@ -2572,6 +2695,7 @@ class MyKeyboardIME : InputMethodService() {
         uiHandler.removeCallbacks(resyncRunnable)
         stopListening()
         WordPredictor.flush()
+        saveTouchModel()
         PerfMonitor.stop()
     }
 

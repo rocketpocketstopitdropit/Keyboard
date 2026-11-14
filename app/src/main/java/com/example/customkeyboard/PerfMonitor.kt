@@ -28,7 +28,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon2"
+    const val BUILD = "mon3"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
@@ -106,6 +106,9 @@ object PerfMonitor {
         o[2] = o[2] + 1L
         if (moved) o[3] = o[3] + 1L
     }
+
+    /** One more line for the report, supplied by the keyboard (the touch model's state). */
+    var extra: (() -> String)? = null
 
     private val offsetLeft: LongArray = LongArray(4)
     private val offsetRight: LongArray = LongArray(4)
@@ -417,9 +420,10 @@ object PerfMonitor {
         sb.append(" | ")
         side("right half", offsetRight)
         sb.append('\n')
+        extra?.let { sb.append(it()).append('\n') }
         sb.append("TOUCHES TAKEN AWAY / NOTES: ").append(notes).append('\n')
         sb.append("TOUCHES (time, D/U/C, key landing%x,y [raw=key under finger] #finger, wait/work ms, slow steps):\n")
-        for (e in events.takeLast(220)) {
+        for (e in events.takeLast(360)) {
             sb.append(String.format("%.2f", (e.eventTimeMs - startedMs) / 1000f)).append(' ').append(e.kind).append(' ')
                 .append(e.label).append(' ').append(e.waitMs).append('/').append(fmt(e.workMs.toDouble()))
             if (e.spans.isNotEmpty()) sb.append(e.spans)
