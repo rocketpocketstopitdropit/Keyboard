@@ -244,7 +244,28 @@ object Autocorrector {
      * Words the person added themselves are never replaced, and backspace
      * straight after undoes it like any other correction.
      */
+    /**
+     * A typed word counts as a likely slip, and isn't learned, when the
+     * sentence and the finger together favoured another word at least this
+     * strongly, even though not enough to swap it ([CONTEXT_FIX_ODDS]).
+     * Otherwise a typo left in the text ("the lazy fog") teaches the keyboard
+     * to expect it, and it gets harder to fix each time.
+     */
+    const val LEARN_DOUBT_ODDS = 3.0
+
+    private var rivalTyped: String? = null
+    private var rivalPrev: String? = null
+    private var rivalValue = 0.0
+
+    /**
+     * How strongly the sentence and the finger favoured some other word over
+     * [word] after [previousWord], when it was last checked (0 = no rival).
+     */
+    fun rivalOdds(word: String, previousWord: String): Double =
+        if (rivalTyped == WordPredictor.normalize(word) && rivalPrev == previousWord) rivalValue else 0.0
+
     private fun contextFix(lower: String, previousWord: String): String? {
+        rivalTyped = null
         if (!contextFixEnabled) return null
         val evidence = touch ?: return null
         if (lower.length < 2 || lower.length > 14 || lower.indexOf('\'') >= 0) return null
@@ -254,6 +275,7 @@ object Autocorrector {
         if (typedLikelihood <= 0.0) return null
         var best: String? = null
         var bestOdds = CONTEXT_FIX_ODDS
+        var strongestRival = 0.0
 
         fun consider(alt: String, fingerOdds: Double, cap: Double = CONTEXT_CAP) {
             if (fingerOdds.isNaN() || fingerOdds <= 0.0) return
@@ -261,6 +283,7 @@ object Autocorrector {
             if (!WordPredictor.seenAfter(previousWord, alt)) return
             val sentence = minOf(cap, WordPredictor.contextProbability(previousWord, alt) / typedLikelihood)
             val total = sentence * fingerOdds
+            if (total > strongestRival) strongestRival = total
             if (total > bestOdds) {
                 bestOdds = total
                 best = alt
@@ -302,6 +325,9 @@ object Autocorrector {
                 if (WordPredictor.isKnown(word)) consider(word, evidence.strayOdds(lower, i), CONTEXT_CAP_LENGTH)
             }
         }
+        rivalTyped = lower
+        rivalPrev = previousWord
+        rivalValue = strongestRival
         return best
     }
 

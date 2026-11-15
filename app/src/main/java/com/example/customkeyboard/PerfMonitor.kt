@@ -29,7 +29,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon6"
+    const val BUILD = "mon7"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
@@ -54,6 +54,8 @@ object PerfMonitor {
     private val echoes = ArrayList<Float>()
     /** Per frame: [intendedVsyncNs, total, input, animation, layoutMeasure, draw, sync, commands, swap] (durations in ns). */
     private val frames = ArrayList<LongArray>()
+    @Volatile
+    private var framesUnreported = 0
 
     private var startedMs = SystemClock.uptimeMillis()
     private var current: Event? = null
@@ -302,7 +304,8 @@ object PerfMonitor {
         stopFrames()
         try {
             val thread = HandlerThread("kbmon").also { it.start() }
-            val listener = Window.OnFrameMetricsAvailableListener { _, m, _ ->
+            val listener = Window.OnFrameMetricsAvailableListener { _, m, dropped ->
+                if (dropped > 0) framesUnreported += dropped
                 val row = longArrayOf(
                     m.getMetric(FrameMetrics.INTENDED_VSYNC_TIMESTAMP),
                     m.getMetric(FrameMetrics.TOTAL_DURATION),
@@ -356,6 +359,7 @@ object PerfMonitor {
         slowMessages.clear()
         echoes.clear()
         synchronized(frames) { frames.clear() }
+        framesUnreported = 0
         startedMs = SystemClock.uptimeMillis()
         last = null
         moveCount = 0
@@ -441,7 +445,7 @@ object PerfMonitor {
 
         val totals = frameCopy.map { it[1] / 1e6f }
         sb.append("FRAMES ms: ").append(summary(totals)).append(" | >17ms ").append(totals.count { it > 17f })
-            .append(" | >34ms ").append(totals.count { it > 34f }).append('\n')
+            .append(" | >34ms ").append(totals.count { it > 34f }).append(" | not reported ").append(framesUnreported).append('\n')
         val slowFrames = frameCopy.filter { it[1] > 20_000_000L }.sortedByDescending { it[1] }.take(12)
         if (slowFrames.isNotEmpty()) {
             sb.append("SLOW FRAMES (at total: input anim layout draw sync cmds swap):\n")

@@ -53,6 +53,8 @@ private const val TOUCH_SIGMA = 0.4
 private const val MAX_TOUCH_D2 = 1.0
 private const val PRIOR_FLOOR = 0.02
 private const val TOUCH_PREFS = "touch_model"
+/** A touch in a gap this close to a non-letter key (space, shift, backspace...) presses it. */
+private const val GAP_SNAP_DP = 14
 
 class MyKeyboardIME : InputMethodService() {
 
@@ -1428,7 +1430,18 @@ class MyKeyboardIME : InputMethodService() {
     /** For the typing monitor: where in the typed key the finger landed, and which key was really under it. */
     private fun touchNote(target: KeyView?, x: Float, y: Float): String {
         val rects = keyRects ?: return ""
-        if (target == null) return ""
+        if (target == null) {
+            // Nothing pressed: say which key was nearest and how far off, in dp.
+            val n = nearestKey(rects, x.toInt(), y.toInt()) ?: return ""
+            val r = rects.first { it.key === n.first }.rect
+            val side = when {
+                y > r.bottom -> "below"
+                y < r.top -> "above"
+                x < r.left -> "left of"
+                else -> "right of"
+            }
+            return " $side " + monitorLabel(n.first) + " by " + (n.second / resources.displayMetrics.density).toInt() + "dp"
+        }
         var chosen: Rect? = null
         var raw: KeyView? = null
         for (e in rects) {
@@ -1797,8 +1810,34 @@ class MyKeyboardIME : InputMethodService() {
                 val r = entry.rect
                 if (x >= r.left && x < r.right && y < r.top && y >= r.top - reach) return entry.key
             }
+            // Any other gap (between keys, or the margin under the bottom row, where the
+            // thumb often lands on the space bar): the nearest key, if a non-letter one is
+            // nearest and close. Letters near the touch are left to the word guess below.
+            val nearest = nearestKey(rects, x, y)
+            if (nearest != null && letterOf(nearest.first.config) == null && nearest.second <= dp(GAP_SNAP_DP)) {
+                PerfMonitor.record("snappedToNearest", 0.0)
+                return nearest.first
+            }
         }
         return chooseLetterKey(x, y, hit, prior, priorMax)
+    }
+
+    /** The key whose box is nearest the point, and how far away it is (0 if inside). */
+    private fun nearestKey(rects: List<KeyRect>, x: Int, y: Int): Pair<KeyView, Float>? {
+        var best: KeyView? = null
+        var bestD = Float.MAX_VALUE
+        for (e in rects) {
+            val r = e.rect
+            if (r.width() <= 0 || r.height() <= 0) continue
+            val dx = maxOf(r.left - x, 0, x - r.right).toFloat()
+            val dy = maxOf(r.top - y, 0, y - r.bottom).toFloat()
+            val d = kotlin.math.sqrt(dx * dx + dy * dy)
+            if (d < bestD) {
+                bestD = d
+                best = e.key
+            }
+        }
+        return best?.let { it to bestD }
     }
 
     /**
@@ -2453,7 +2492,11 @@ class MyKeyboardIME : InputMethodService() {
     private fun finishWord(word: String, weight: Float) {
         val bare = word.trimEnd('\'', '\u2019')
         if (bare.isNotEmpty()) {
-            if (learningAllowed) {
+            // A word that looked like a slip for another one isn't learned, so a typo left in
+            // the text can't teach the keyboard to expect it. (Kept on purpose = learned.)
+            val doubtful = weight <= 1f && Autocorrector.rivalOdds(bare, previousWord) >= Autocorrector.LEARN_DOUBT_ODDS
+            if (doubtful && learningAllowed) PerfMonitor.note('X', "not learned, looked like a slip: $bare")
+            if (learningAllowed && !doubtful) {
                 PerfMonitor.span("learn") { WordPredictor.learn(previousWord, bare, weight) }
                 scheduleFlush()
             }

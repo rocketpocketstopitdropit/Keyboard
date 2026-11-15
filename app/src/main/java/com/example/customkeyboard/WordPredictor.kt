@@ -1055,11 +1055,15 @@ object WordPredictor {
         return built
     }
 
-    /** True if [word] is one of the usable words (the ones predictions are drawn from). */
-    private fun inVocabulary(idx: VocabIndex, word: String): Boolean {
-        val i = firstWithPrefix(idx, word)
-        return i < idx.sorted.size && idx.sorted[i] == word
-    }
+    /**
+     * True if [word] is one of the usable words (the ones predictions are
+     * drawn from): the same test as finding it in the sorted list, but a few
+     * map lookups instead of a binary search through 100,000 words. It runs
+     * for every word the person has typed, after every space.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    private fun inVocabulary(idx: VocabIndex, word: String): Boolean =
+        if (rank.containsKey(word)) !user.isBlocked(word) || user.isAdded(word) else user.isAdded(word)
 
     /**
      * Adds into [out] (a-z) the summed [probability] of every usable word that
