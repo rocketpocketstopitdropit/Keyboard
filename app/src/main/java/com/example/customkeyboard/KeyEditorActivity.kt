@@ -130,6 +130,18 @@ class KeyEditorActivity : Activity() {
                 KeyboardPrefs.setDoubleSpacePeriod(this, it)
             }
         )
+        controls.addView(
+            toggleRow("Fix real words from the sentence", KeyboardPrefs.getContextFix(this)) {
+                KeyboardPrefs.setContextFix(this, it)
+            }
+        )
+        controls.addView(TextView(this).apply {
+            text = "Swaps a real word for a look-alike when the sentence calls for it and your " +
+                "finger wasn't squarely on the key (\"wait for thus\" becomes \"this\"). " +
+                "Backspace straight after puts your word back."
+            textSize = 12f
+            alpha = 0.7f
+        })
         // ---- Look up a word: is it in the keyboard's word data, and what happens when it's typed? ----
         controls.addView(TextView(this).apply {
             text = "Look up a word"

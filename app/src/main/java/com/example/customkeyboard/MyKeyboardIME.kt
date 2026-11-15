@@ -225,6 +225,34 @@ class MyKeyboardIME : InputMethodService() {
         wordTouches.clear()
     }
 
+    /**
+     * For the autocorrector: going by where the finger for letter [position]
+     * of [word] landed, how many times likelier it was aiming at [alt] than at
+     * the letter it typed. Each letter is judged against this person's usual
+     * landing spot for it, the same way the key was picked in the first
+     * place. NaN when there's no touch to go by, or it was nowhere near [alt].
+     */
+    private fun touchOddsFor(word: String, position: Int, alt: Char): Double {
+        if (wordTouches.size != currentWord.length || position < 0 || position >= wordTouches.size) return Double.NaN
+        if (!word.contentEquals(currentWord, ignoreCase = true)) return Double.NaN
+        val touch = wordTouches[position] ?: return Double.NaN
+        val typed = spotDistance2(touch, word[position].lowercaseChar())
+        val other = spotDistance2(touch, alt)
+        if (typed.isNaN() || other.isNaN() || other > 2.25) return Double.NaN
+        return kotlin.math.exp(-(other - typed) / (2.0 * TOUCH_SIGMA * TOUCH_SIGMA))
+    }
+
+    /** Squared distance, in key sizes, from a touch to where the finger usually lands for [letter]. */
+    private fun spotDistance2(touch: FloatArray, letter: Char): Double {
+        val lr = letterRects.firstOrNull { it.letter == letter } ?: return Double.NaN
+        val w = lr.rect.width()
+        val h = lr.rect.height()
+        if (w <= 0 || h <= 0) return Double.NaN
+        val dx = (touch[0] - lr.rect.exactCenterX()) / w - touchModel.offsetX(letter)
+        val dy = (touch[1] - lr.rect.exactCenterY()) / h - touchModel.offsetY(letter)
+        return (dx * dx + dy * dy).toDouble()
+    }
+
     /** Loads the landing spots learned for this layout and screen width; unlearned keys get a starting guess. */
     private fun prepareTouchModel(root: View, letters: List<LetterRect>) {
         val widthDp = resources.configuration.screenWidthDp
@@ -283,6 +311,10 @@ class MyKeyboardIME : InputMethodService() {
     private fun correctionFor(typed: String): String? {
         if (corrTyped == typed && corrPrev == previousWord) return corrResult
         val result = PerfMonitor.span("correction") { Autocorrector.correctionFor(typed, previousWord) }
+        // For the typing monitor: a real word swapped for another one.
+        if (result != null && learningAllowed && WordPredictor.isKnown(typed)) {
+            PerfMonitor.note('X', "real word changed: $typed -> $result")
+        }
         corrTyped = typed
         corrPrev = previousWord
         corrResult = result
@@ -328,6 +360,7 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.addPrimaryClipChangedListener(clipListener)
         // The autocorrect search runs in the background; fill in the bar when it lands.
         Autocorrector.onReady = { if (currentWord.isNotEmpty()) PerfMonitor.span("barRefresh") { updateSuggestions() } }
+        Autocorrector.touchOdds = { word, position, alt -> touchOddsFor(word, position, alt) }
         PerfMonitor.extra = {
             "TOUCH MODEL " + (touchModelId ?: "-") + " (letter dx,dy % of key / touches learned):" + touchModel.describe()
         }
@@ -338,6 +371,7 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.removePrimaryClipChangedListener(clipListener)
         speechRecognizer?.destroy()
         Autocorrector.onReady = null
+        Autocorrector.touchOdds = null
         PerfMonitor.extra = null
     }
 
@@ -2424,6 +2458,8 @@ class MyKeyboardIME : InputMethodService() {
             previousWord = WordPredictor.pushContext(previousWord, bare)
         }
         learnTouches(word)
+        // The next word's correction depends on its own touches, even if it's the same word again.
+        corrTyped = null
         currentWord.clear()
         wordAfterDigit = false
     }
@@ -2460,6 +2496,7 @@ class MyKeyboardIME : InputMethodService() {
         val plainText = isText && !isPassword && !isStructured
         autoCapAllowed = plainText && KeyboardPrefs.getAutoCapitalize(this)
         autoPeriodAllowed = plainText && KeyboardPrefs.getDoubleSpacePeriod(this)
+        Autocorrector.contextFixEnabled = KeyboardPrefs.getContextFix(this)
     }
 
     private fun textBeforeIsWordThenSpace(ic: InputConnection): Boolean {

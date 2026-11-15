@@ -15,6 +15,7 @@ object KeyboardPrefs {
     private const val PREDICTION_STRENGTH = "prediction_strength"
     private const val AUTO_CAPITALIZE = "auto_capitalize"
     private const val DOUBLE_SPACE_PERIOD = "double_space_period"
+    private const val CONTEXT_FIX = "context_fix"
     private const val KLIPY_KEY = "klipy_api_key"
     private const val SPLIT_LAYOUT = "split_thumb_layout"
 
@@ -76,6 +77,12 @@ object KeyboardPrefs {
         prefs(context).getBoolean(AUTO_CAPITALIZE, true)
     fun setAutoCapitalize(context: Context, value: Boolean) =
         prefs(context).edit().putBoolean(AUTO_CAPITALIZE, value).apply()
+
+    // A real word may be swapped for a look-alike the sentence calls for ("wait for thus" -> "this").
+    fun getContextFix(context: Context): Boolean =
+        prefs(context).getBoolean(CONTEXT_FIX, true)
+    fun setContextFix(context: Context, value: Boolean) =
+        prefs(context).edit().putBoolean(CONTEXT_FIX, value).apply()
 
     // Two quick taps on the space bar type ". " in place of "  ".
     fun getDoubleSpacePeriod(context: Context): Boolean =

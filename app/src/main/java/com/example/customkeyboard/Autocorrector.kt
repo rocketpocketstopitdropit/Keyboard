@@ -148,6 +148,103 @@ object Autocorrector {
         return best
     }
 
+    // ---------- a real word that the sentence says is the wrong one ----------
+
+    /** Off = a real word is never swapped for another (the "Fix real words from context" setting). */
+    var contextFixEnabled = true
+
+    /**
+     * Supplied by the keyboard. For letter [position] of [word] (the word
+     * being typed): how many times likelier the finger was aiming at [alt]
+     * than at the letter it typed, going by where it landed (above 1 =
+     * likelier, below 1 = less likely). NaN = no touch to go by.
+     */
+    var touchOdds: ((word: String, position: Int, alt: Char) -> Double)? = null
+
+    /** The swap happens only when the other word is at least this many times likelier overall. */
+    private const val CONTEXT_FIX_ODDS = 30.0
+
+    /**
+     * The most the sentence alone may count for. With this cap, a finger that
+     * came down squarely on its key (which counts roughly 40 to 1 against a
+     * swap) always wins, however unlikely the word looks in the sentence.
+     */
+    private const val CONTEXT_CAP = 300.0
+
+    /**
+     * Words at least this common ("now", "so", "on") are typed on purpose all
+     * day and their look-alikes are just as common, so they're left alone.
+     */
+    private const val CONTEXT_MAX_TYPED_ZIPF = 5.5
+
+    private val NEIGHBOURS: Map<Char, CharArray> by lazy {
+        val map = HashMap<Char, CharArray>()
+        for ((a, pa) in POSITIONS) {
+            map[a] = POSITIONS.filter { (b, pb) -> b != a && areNeighbours(pa, pb) }.keys.sorted().toCharArray()
+        }
+        map
+    }
+
+    /**
+     * The typed word is a real one, but one slip onto a neighbouring key (or
+     * two letters typed at the same instant, swapped) would make a different
+     * real word. That other word replaces it only when both kinds of
+     * evidence, multiplied together, favour it at least [CONTEXT_FIX_ODDS] to
+     * one:
+     *  - the sentence: how much likelier the other word is after the words
+     *    before it ("wait for this" against "wait for thus"), and only if the
+     *    other word has really been seen there, never on word frequency alone;
+     *  - the finger: where it landed, against where this person's finger
+     *    usually lands for each of the two letters. A touch squarely on the
+     *    typed key counts heavily against the swap.
+     * Words the person added themselves are never replaced, and backspace
+     * straight after undoes it like any other correction.
+     */
+    private fun contextFix(lower: String, previousWord: String): String? {
+        if (!contextFixEnabled) return null
+        val odds = touchOdds ?: return null
+        if (lower.length < 2 || lower.length > 14 || lower.indexOf('\'') >= 0) return null
+        if (WordPredictor.isAddedWord(lower)) return null
+        if ((WordPredictor.zipfOf(lower) ?: 0.0) >= CONTEXT_MAX_TYPED_ZIPF) return null
+        val typedLikelihood = WordPredictor.contextProbability(previousWord, lower)
+        if (typedLikelihood <= 0.0) return null
+        var best: String? = null
+        var bestOdds = CONTEXT_FIX_ODDS
+
+        fun consider(alt: String, fingerOdds: Double) {
+            if (fingerOdds.isNaN() || fingerOdds <= 0.0) return
+            if (!WordPredictor.isKnown(alt) || WordPredictor.rareZipfOf(alt) != null) return
+            if (!WordPredictor.seenAfter(previousWord, alt)) return
+            val sentence = minOf(CONTEXT_CAP, WordPredictor.contextProbability(previousWord, alt) / typedLikelihood)
+            val total = sentence * fingerOdds
+            if (total > bestOdds) {
+                bestOdds = total
+                best = alt
+            }
+        }
+
+        val chars = lower.toCharArray()
+        for (i in chars.indices) {
+            val typed = chars[i]
+            val near = NEIGHBOURS[typed] ?: continue
+            for (alt in near) {
+                chars[i] = alt
+                val word = String(chars)
+                // The cheap test first: most letter swaps don't make a word at all.
+                if (WordPredictor.isKnown(word)) consider(word, odds(lower, i, alt))
+            }
+            chars[i] = typed
+        }
+        // Two letters that landed at the same instant: the finger can't say which came first.
+        if (doubtWord == lower) {
+            for (i in doubtPairs) {
+                if (i < 0 || i + 1 >= lower.length || lower[i] == lower[i + 1]) continue
+                consider(lower.substring(0, i) + lower[i + 1] + lower[i] + lower.substring(i + 2), 1.0)
+            }
+        }
+        return best
+    }
+
     private fun substitutionCost(typed: Char, intended: Char): Double {
         if (typed == intended) return 0.0
         if (typed.code < 128 && intended.code < 128) return SUB_COST[typed.code][intended.code]
@@ -298,8 +395,13 @@ object Autocorrector {
             // Rare entries in the big word list include everyday slips ("rhe",
             // "abd", "yoy"), so a rare word still gets fixed when a far more
             // common word is one slip away.
-            val zipf = WordPredictor.rareZipfOf(lower) ?: return null to true
-            return rareWordCorrection(lower, zipf, previousWord, wait)
+            val zipf = WordPredictor.rareZipfOf(lower)
+            if (zipf != null) {
+                val rare = rareWordCorrection(lower, zipf, previousWord, wait)
+                if (rare.first != null || !rare.second) return rare
+            }
+            // A normal word, but maybe not the one the sentence calls for.
+            return contextFix(lower, previousWord) to true
         }
 
         // Possessives and "'s" contractions ("john's") are almost never typos.

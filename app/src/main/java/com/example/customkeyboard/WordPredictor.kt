@@ -872,6 +872,24 @@ object WordPredictor {
         return p + FLOOR
     }
 
+    /** How likely [word] is as the next word after [previous] (the same blend the predictions use). */
+    fun contextProbability(previous: String, word: String): Double =
+        probability(normalize(word), contextFor(previous))
+
+    /**
+     * True if [word] has actually been seen following [previous]: in the
+     * conversation counts, the curated pairs, or the person's own typing.
+     */
+    fun seenAfter(previous: String, word: String): Boolean {
+        val ctx = contextFor(previous)
+        val w = normalize(word)
+        return ctx.pairRow?.containsKey(w) == true || ctx.tripleRow?.containsKey(w) == true ||
+                ctx.curated.containsKey(w) || ctx.userRow?.containsKey(w) == true
+    }
+
+    /** A word the person added to the keyboard themselves. */
+    fun isAddedWord(word: String): Boolean = user.isAdded(normalize(word))
+
     /** Overall frequency of a word (blended with the person's own usage). */
     fun frequencyOf(word: String): Double = probability(normalize(word), contextFor(""))
 
