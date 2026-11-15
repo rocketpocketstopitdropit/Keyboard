@@ -1513,6 +1513,7 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     private fun pointerDown(id: Int, x: Float, y: Float) {
+        ensureLetterPrior()
         // A new touch in a slot whose last finger was never reported as lifted: that
         // finger's key press would vanish without a trace, so finish it first.
         if (touches.get(id) != null) {
@@ -2595,7 +2596,9 @@ class MyKeyboardIME : InputMethodService() {
             return
         }
 
-        if (typed.isEmpty() || !autocorrectAllowed || suggestionViews.size < 3) {
+        // Suggestions start at the second letter: one letter matches thousands of words,
+        // and working through them right as a word starts held up the next key press.
+        if (typed.length < 2 || !autocorrectAllowed || suggestionViews.size < 3) {
             acceptWord = null
             if (suggestionsSeparate) {
                 // The suggestion spot stays where it is, just empty.
@@ -2687,7 +2690,29 @@ class MyKeyboardIME : InputMethodService() {
     private fun priorActive(): Boolean =
         predictionStrength > 0 && !gifMode && !wordMode && autocorrectAllowed && page == KeyboardPage.LETTERS
 
+    /**
+     * The next-letter odds are worked out just after a key press is finished
+     * rather than inside it, so the press (and the letter or space it types)
+     * is never held up by them. A finger that lands before that has happened
+     * works them out itself ([ensureLetterPrior]).
+     */
+    private var priorStale = false
+    private val priorRunnable = Runnable { ensureLetterPrior() }
+
+    private fun schedulePriorRefresh() {
+        priorStale = true
+        uiHandler.removeCallbacks(priorRunnable)
+        uiHandler.post(priorRunnable)
+    }
+
+    private fun ensureLetterPrior() {
+        if (!priorStale) return
+        PerfMonitor.span("letterOdds") { refreshLetterPrior() }
+    }
+
     private fun refreshLetterPrior() {
+        priorStale = false
+        uiHandler.removeCallbacks(priorRunnable)
         if (!priorActive()) {
             letterPrior = emptyMap()
             letterPriorMax = 0.0
@@ -2702,7 +2727,7 @@ class MyKeyboardIME : InputMethodService() {
 
     /** The touch model updates right away; the suggestion bar can wait for a pause in typing. */
     private fun updatePrediction() {
-        PerfMonitor.span("letterOdds") { refreshLetterPrior() }
+        schedulePriorRefresh()
         // Start the autocorrect search now, in the background, so it's usually
         // finished by the time the bar updates or space is pressed.
         if (currentWord.isNotEmpty() && autocorrectAllowed && !gifMode && !wordMode) {

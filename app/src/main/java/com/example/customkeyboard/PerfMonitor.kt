@@ -29,7 +29,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon7"
+    const val BUILD = "mon8"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
@@ -429,12 +429,14 @@ object PerfMonitor {
         sb.append("WORK ms (keyboard code): down ").append(summary(downs.map { it.workMs }))
             .append(" | up ").append(summary(ups.map { it.workMs })).append('\n')
 
-        // Finger down -> the pressed key actually on screen.
+        // Finger down -> the pressed key actually on screen: the first frame after the touch.
+        // (Touches are handled inside a frame, so the frame that started before the
+        // keyboard's code ran is the one that draws the press.)
         val frameCopy = synchronized(frames) { ArrayList(frames) }
         val visual = ArrayList<Float>()
         var fi = 0
         for (e in downs) {
-            while (fi < frameCopy.size && frameCopy[fi][0] < e.handledNs - 2_000_000L) fi++
+            while (fi < frameCopy.size && frameCopy[fi][0] < e.eventTimeMs * 1_000_000L) fi++
             if (fi >= frameCopy.size) break
             val f = frameCopy[fi]
             val ms = (f[0] + f[1]) / 1e6f - e.eventTimeMs
