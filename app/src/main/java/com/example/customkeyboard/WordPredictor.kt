@@ -887,6 +887,9 @@ object WordPredictor {
                 ctx.curated.containsKey(w) || ctx.userRow?.containsKey(w) == true
     }
 
+    /** One of the keyboard's own everyday texting words ("yo", "lol", "gonna"), typed on purpose. */
+    fun isTextingWord(word: String): Boolean = normalize(word) in curatedWords
+
     /** A word the person added to the keyboard themselves. */
     fun isAddedWord(word: String): Boolean = user.isAdded(normalize(word))
 

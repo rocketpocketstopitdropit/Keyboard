@@ -30,8 +30,22 @@ object Autocorrector {
     }
 
     private const val NEIGHBOUR_COST = 0.3
+
+    /** A letter typed twice by accident ("lookk") costs this as a stray extra tap. */
+    const val DOUBLED_EXTRA = 0.5
+
+    /** Two letters that landed at the same instant, read the other way round. */
+    private const val RACE_SWAP_COST = 0.1
     private const val TRANSPOSE_COST = 0.6
     private const val PRIOR_WEIGHT = 0.6
+
+    /**
+     * The same, when the letters are judged by their touches. Touch costs run
+     * from almost nothing (a tap between two keys) to a lot (a clean tap), so
+     * the sentence needs more say to settle the close calls. Tuned on typing
+     * simulated from the typing monitor's measurements.
+     */
+    private const val TOUCH_PRIOR_WEIGHT = 1.0
 
     /** A rare word is only fixed toward a word at least this much more common (Zipf, ~300x). */
     private const val RARE_GAP = 2.5
@@ -154,12 +168,24 @@ object Autocorrector {
     var contextFixEnabled = true
 
     /**
-     * Supplied by the keyboard. For letter [position] of [word] (the word
-     * being typed): how many times likelier the finger was aiming at [alt]
-     * than at the letter it typed, going by where it landed (above 1 =
-     * likelier, below 1 = less likely). NaN = no touch to go by.
+     * What the fingers' landing spots say about the word being typed: costs
+     * per typed letter for the word search, built by the keyboard (see
+     * [TouchEvidence.costs]). Immutable once made, so the background search
+     * can read it.
      */
-    var touchOdds: ((word: String, position: Int, alt: Char) -> Double)? = null
+    class TouchCosts(
+        /** [i][c - 'a']: reading typed letter i as letter c. Null row = no touch; use the fixed costs. */
+        val sub: Array<DoubleArray?>,
+        /** Typed letter i being a stray extra tap. */
+        val extra: DoubleArray,
+        /** race[i]: letters i-1 and i landed at almost the same instant, so either may have come first. */
+        val race: BooleanArray,
+        /** Tells one set of touches from another, for caching searches. */
+        val key: String
+    )
+
+    /** The keyboard's touches for the word being typed. Null = go by the letters alone. */
+    var touch: TouchEvidence? = null
 
     /** The swap happens only when the other word is at least this many times likelier overall. */
     private const val CONTEXT_FIX_ODDS = 30.0
@@ -176,6 +202,24 @@ object Autocorrector {
      * day and their look-alikes are just as common, so they're left alone.
      */
     private const val CONTEXT_MAX_TYPED_ZIPF = 5.5
+
+    /**
+     * A letter added or taken away has no touch to argue against it, so the
+     * sentence may count for more, up to this; but the finger side then
+     * starts well against it ([MISSING_TAP_ODDS], [TouchEvidence.strayOdds]),
+     * so only an overwhelming sentence ("over te" -> "over the") does it.
+     */
+    private const val CONTEXT_CAP_LENGTH = 10000.0
+
+    /** How a tap that never reached the keyboard compares with the word being typed as it is. */
+    private const val MISSING_TAP_ODDS = 1.0 / 40.0
+
+    /**
+     * Adding or removing a letter is tried only for typed words rarer than
+     * this ("te", "dong"). Everyday words ("died", "doors") are typed on
+     * purpose too often for a sentence to overrule them that way.
+     */
+    private const val LENGTH_FIX_MAX_ZIPF = 4.5
 
     private val NEIGHBOURS: Map<Char, CharArray> by lazy {
         val map = HashMap<Char, CharArray>()
@@ -202,7 +246,7 @@ object Autocorrector {
      */
     private fun contextFix(lower: String, previousWord: String): String? {
         if (!contextFixEnabled) return null
-        val odds = touchOdds ?: return null
+        val evidence = touch ?: return null
         if (lower.length < 2 || lower.length > 14 || lower.indexOf('\'') >= 0) return null
         if (WordPredictor.isAddedWord(lower)) return null
         if ((WordPredictor.zipfOf(lower) ?: 0.0) >= CONTEXT_MAX_TYPED_ZIPF) return null
@@ -211,11 +255,11 @@ object Autocorrector {
         var best: String? = null
         var bestOdds = CONTEXT_FIX_ODDS
 
-        fun consider(alt: String, fingerOdds: Double) {
+        fun consider(alt: String, fingerOdds: Double, cap: Double = CONTEXT_CAP) {
             if (fingerOdds.isNaN() || fingerOdds <= 0.0) return
             if (!WordPredictor.isKnown(alt) || WordPredictor.rareZipfOf(alt) != null) return
             if (!WordPredictor.seenAfter(previousWord, alt)) return
-            val sentence = minOf(CONTEXT_CAP, WordPredictor.contextProbability(previousWord, alt) / typedLikelihood)
+            val sentence = minOf(cap, WordPredictor.contextProbability(previousWord, alt) / typedLikelihood)
             val total = sentence * fingerOdds
             if (total > bestOdds) {
                 bestOdds = total
@@ -231,7 +275,7 @@ object Autocorrector {
                 chars[i] = alt
                 val word = String(chars)
                 // The cheap test first: most letter swaps don't make a word at all.
-                if (WordPredictor.isKnown(word)) consider(word, odds(lower, i, alt))
+                if (WordPredictor.isKnown(word)) consider(word, evidence.odds(lower, i, alt))
             }
             chars[i] = typed
         }
@@ -240,6 +284,22 @@ object Autocorrector {
             for (i in doubtPairs) {
                 if (i < 0 || i + 1 >= lower.length || lower[i] == lower[i + 1]) continue
                 consider(lower.substring(0, i) + lower[i + 1] + lower[i] + lower.substring(i + 2), 1.0)
+            }
+        }
+        // A tap that never reached the keyboard ("te" for "the")...
+        val lengthFixes = (WordPredictor.zipfOf(lower) ?: 0.0) < LENGTH_FIX_MAX_ZIPF &&
+                !WordPredictor.isTextingWord(lower)
+        if (lengthFixes) for (i in 0..lower.length) {
+            for (c in 'a'..'z') {
+                val word = lower.substring(0, i) + c + lower.substring(i)
+                if (WordPredictor.isKnown(word)) consider(word, MISSING_TAP_ODDS, CONTEXT_CAP_LENGTH)
+            }
+        }
+        // ...or a stray extra one ("dong" for "dog"), likelier when it landed off its key.
+        if (lengthFixes && lower.length >= 3) {
+            for (i in lower.indices) {
+                val word = lower.substring(0, i) + lower.substring(i + 1)
+                if (WordPredictor.isKnown(word)) consider(word, evidence.strayOdds(lower, i), CONTEXT_CAP_LENGTH)
             }
         }
         return best
@@ -313,6 +373,66 @@ object Autocorrector {
     }
 
     /** True if [b] is [a] with one pair of neighbouring letters swapped ("teh" / "the"). */
+    /**
+     * [typoDistance], but each typed letter is judged by where its finger
+     * landed ([tc]): reading it as a letter its finger was near is cheap, as
+     * one it was squarely away from is dear; a tap that landed off its key is
+     * a cheaper stray; and two letters that landed at the same instant may be
+     * read the other way round, even with a slip in either.
+     */
+    private fun touchDistance(a: String, b: String, limit: Double, ws: Workspace, tc: TouchCosts): Double {
+        val n = a.length
+        val m = b.length
+        var prev2 = ws.a
+        var prev1 = ws.b
+        var cur = ws.c
+        for (j in 0..m) prev1[j] = j.toDouble()
+        var lastRowMin = 0.0
+
+        fun sub(i: Int, intended: Char): Double {
+            val typed = a[i]
+            if (typed == intended) return 0.0
+            val row = tc.sub[i]
+            return if (row != null && intended in 'a'..'z') row[intended - 'a'] else substitutionCost(typed, intended)
+        }
+
+        for (i in 1..n) {
+            cur[0] = prev1[0] + tc.extra[i - 1]
+            var rowMin = cur[0]
+            val extraCost = tc.extra[i - 1]
+            val race = i > 1 && tc.race[i - 1]
+            for (j in 1..m) {
+                var best = prev1[j - 1] + sub(i - 1, b[j - 1])
+                val del = prev1[j] + extraCost
+                if (del < best) best = del
+                val ins = cur[j - 1] + missingCost(b, j - 1)
+                if (ins < best) best = ins
+                if (i > 1 && j > 1) {
+                    if (a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
+                        val swap = prev2[j - 2] + (if (race) RACE_SWAP_COST else TRANSPOSE_COST)
+                        if (swap < best) best = swap
+                    } else if (race) {
+                        // Landed in the wrong order, and one or both a little off their keys.
+                        val cross = prev2[j - 2] + RACE_SWAP_COST + sub(i - 1, b[j - 2]) + sub(i - 2, b[j - 1])
+                        if (cross < best) best = cross
+                    }
+                }
+                cur[j] = best
+                if (best < rowMin) rowMin = best
+            }
+            if (rowMin > limit && lastRowMin > limit) return rowMin
+            lastRowMin = rowMin
+            val tmp = prev2
+            prev2 = prev1
+            prev1 = cur
+            cur = tmp
+        }
+        return prev1[m]
+    }
+
+    private fun distance(a: String, b: String, limit: Double, ws: Workspace, tc: TouchCosts?): Double =
+        if (tc == null) typoDistance(a, b, limit, ws) else touchDistance(a, b, limit, ws, tc)
+
     private fun isSwap(a: String, b: String): Boolean {
         if (a.length != b.length) return false
         var first = -1
@@ -337,13 +457,15 @@ object Autocorrector {
      */
     private fun rareWordCorrection(lower: String, zipf: Double, previousWord: String, wait: Boolean): Pair<String?, Boolean> {
         if (lower.length < 3) return null to true
-        val cands = candidates(Job.RARE, lower, zipf, wait) ?: return null to false
+        val tc = touch?.costs(lower)
+        val cands = candidates(Job.RARE, lower, zipf, wait, tc) ?: return null to false
         val prior = WordPredictor.priorScorer(previousWord)
+        val weight = if (tc != null) TOUCH_PRIOR_WEIGHT else PRIOR_WEIGHT
         var best: String? = null
         var bestScore = Double.MAX_VALUE
         // Candidates arrive in the dictionary's order, so ties go to the more common word, as before.
         for (c in cands) {
-            val score = c.distance - PRIOR_WEIGHT * prior(c.word)
+            val score = c.distance - weight * prior(c.word)
             if (score < bestScore) {
                 bestScore = score
                 best = c.word
@@ -353,7 +475,7 @@ object Autocorrector {
     }
 
     /** The slow part of [rareWordCorrection]: which common words are one slip away. Runs off the main thread. */
-    private fun rareCandidates(lower: String, zipf: Double, buckets: Array<List<String>>): List<Cand> {
+    private fun rareCandidates(lower: String, zipf: Double, buckets: Array<List<String>>, tc: TouchCosts?): List<Cand> {
         val minZipf = maxOf(zipf + RARE_GAP, RARE_MIN_TARGET)
         val ws = Workspace(lower.length + 3)
         val out = ArrayList<Cand>()
@@ -361,7 +483,7 @@ object Autocorrector {
         for (candidate in bucket) {
             val cz = WordPredictor.zipfOf(candidate) ?: continue
             if (cz < minZipf) continue
-            val d = typoDistance(lower, candidate, TRANSPOSE_COST + 0.05, ws)
+            val d = distance(lower, candidate, TRANSPOSE_COST + 0.05, ws, tc)
             val ok = d <= NEIGHBOUR_COST + 0.05 ||
                     (d <= TRANSPOSE_COST + 0.05 && (zipf < VERY_RARE_ZIPF || isSwap(lower, candidate)))
             if (ok) out.add(Cand(candidate, d))
@@ -417,6 +539,7 @@ object Autocorrector {
     private var nearTyped: String? = null
     private var nearPrev: String? = null
     private var nearStamp = -1
+    private var nearTouchKey: String? = null
     private var nearResult: List<String> = emptyList()
 
     /**
@@ -433,24 +556,29 @@ object Autocorrector {
 
     private fun nearWords(lower: String, previousWord: String, wait: Boolean): List<String>? {
         val stamp = WordPredictor.vocabularyStamp()
-        if (nearTyped == lower && nearPrev == previousWord && nearStamp == stamp) return nearResult
-        val cands = candidates(Job.NEAR, lower, 0.0, wait) ?: return null
+        val tc = touch?.costs(lower)
+        if (nearTyped == lower && nearPrev == previousWord && nearStamp == stamp && nearTouchKey == tc?.key) {
+            return nearResult
+        }
+        val cands = candidates(Job.NEAR, lower, 0.0, wait, tc) ?: return null
         val prior = WordPredictor.priorScorer(previousWord)
         // Candidates come in the same order the old single-thread search found them
         // (shortest first, then by how common), and the sort is stable, so ties land the same way.
+        val weight = if (tc != null) TOUCH_PRIOR_WEIGHT else PRIOR_WEIGHT
         val found = ArrayList<Pair<String, Double>>(cands.size)
-        for (c in cands) found.add(c.word to c.distance - PRIOR_WEIGHT * prior(c.word))
+        for (c in cands) found.add(c.word to c.distance - weight * prior(c.word))
         found.sortBy { it.second }
         val result = found.take(NEAR_COUNT).map { it.first }
         nearTyped = lower
         nearPrev = previousWord
         nearStamp = stamp
+        nearTouchKey = tc?.key
         nearResult = result
         return result
     }
 
     /** The slow part of [nearWords]: every real word within reach of the typed one. Runs off the main thread. */
-    private fun nearCandidates(lower: String, buckets: Array<List<String>>): List<Cand> {
+    private fun nearCandidates(lower: String, buckets: Array<List<String>>, tc: TouchCosts?): List<Cand> {
         val limit = limitFor(lower.length)
         val ws = Workspace(lower.length + 4)
         // The cheapest a missing or extra letter can be is DOUBLED_COST, which bounds the length gap.
@@ -463,10 +591,12 @@ object Autocorrector {
             if (length < 1 || length >= buckets.size) continue
             val farLength = abs(length - lower.length) >= 2
             for (candidate in buckets[length]) {
-                val sameStart = candidate[0] == lower[0]
+                // First two letters that landed at the same instant may be either way round.
+                val sameStart = candidate[0] == lower[0] ||
+                        (lower.length > 1 && tc != null && tc.race[1] && candidate[0] == lower[1])
                 if (farLength && !sameStart) continue
                 val cap = if (sameStart) limit else otherStartLimit
-                val d = typoDistance(lower, candidate, cap, ws)
+                val d = distance(lower, candidate, cap, ws, tc)
                 if (d > cap) continue
                 found.add(Cand(candidate, d))
             }
@@ -511,8 +641,8 @@ object Autocorrector {
      * whatever is left of the search (space and punctuation need the
      * answer); otherwise null means "not ready yet".
      */
-    private fun candidates(kind: Char, lower: String, zipf: Double, wait: Boolean): List<Cand>? {
-        val key = "$kind|${WordPredictor.vocabularyStamp()}|$lower"
+    private fun candidates(kind: Char, lower: String, zipf: Double, wait: Boolean, tc: TouchCosts?): List<Cand>? {
+        val key = "$kind|${WordPredictor.vocabularyStamp()}|$lower|${tc?.key ?: ""}"
         var search = searches[key]
         if (search == null || search.isCancelled) {
             // A newer word makes any search that hasn't started yet pointless.
@@ -526,7 +656,7 @@ object Autocorrector {
             }
             val buckets = WordPredictor.lengthBuckets()
             val created = Search(Callable {
-                if (kind == Job.RARE) rareCandidates(lower, zipf, buckets) else nearCandidates(lower, buckets)
+                if (kind == Job.RARE) rareCandidates(lower, zipf, buckets, tc) else nearCandidates(lower, buckets, tc)
             })
             searches[key] = created
             while (searches.size > 8) searches.remove(searches.keys.first())

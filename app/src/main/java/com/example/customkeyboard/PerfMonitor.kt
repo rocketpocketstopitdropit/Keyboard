@@ -11,6 +11,7 @@ import android.os.SystemClock
 import android.util.Printer
 import android.view.FrameMetrics
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Window
 import android.view.inputmethod.InputConnection
 import android.view.inputmethod.InputConnectionWrapper
@@ -28,7 +29,7 @@ import android.view.inputmethod.InputConnectionWrapper
 object PerfMonitor {
 
     /** Bump with each build that changes what is measured, so reports can be told apart. */
-    const val BUILD = "mon5"
+    const val BUILD = "mon6"
 
     private const val MAX_EVENTS = 600
     private const val MAX_FRAMES = 8000
@@ -105,6 +106,61 @@ object PerfMonitor {
         o[1] = o[1] + dyPct.toLong()
         o[2] = o[2] + 1L
         if (moved) o[3] = o[3] + 1L
+    }
+
+    // ---------- fingers on their way in, before the keyboard's code sees them ----------
+
+    /** One finger landing, and how far in it got: the window, the keyboard's top view, the keyboard's code. */
+    private class Arrival(val timeMs: Long, val id: Int, val sx: Float, val sy: Float, val size: Float) {
+        var window = false
+        var tree = false
+        var handled = false
+    }
+
+    private val arrivals = ArrayList<Arrival>()
+    private var windowCancels = 0
+    private var accidentalCancels = 0
+
+    /** Supplied by the keyboard: the key under a point on the screen ("gap", "outside"). */
+    var keyAt: ((Float, Float) -> String)? = null
+
+    private fun arrivalFor(e: MotionEvent): Arrival? {
+        val m = e.actionMasked
+        if (m != MotionEvent.ACTION_DOWN && m != MotionEvent.ACTION_POINTER_DOWN) return null
+        val i = e.actionIndex
+        val id = e.getPointerId(i)
+        for (k in arrivals.indices.reversed()) {
+            val a = arrivals[k]
+            if (a.timeMs == e.eventTime && a.id == id) return a
+            if (e.eventTime - a.timeMs > 3000L) break
+        }
+        val sx = if (Build.VERSION.SDK_INT >= 29) e.getRawX(i) else e.rawX
+        val sy = if (Build.VERSION.SDK_INT >= 29) e.getRawY(i) else e.rawY
+        val a = Arrival(e.eventTime, id, sx, sy, e.getTouchMajor(i))
+        if (arrivals.size >= 1500) arrivals.removeAt(0)
+        arrivals.add(a)
+        return a
+    }
+
+    /** Every touch event the keyboard's window receives. */
+    fun windowEvent(e: MotionEvent) {
+        if (e.actionMasked == MotionEvent.ACTION_CANCEL) {
+            windowCancels++
+            // FLAG_CANCELED (Android 13+): the phone decided the touch was accidental (a palm, say).
+            if (e.flags and 0x20 != 0) accidentalCancels++
+            return
+        }
+        arrivalFor(e)?.window = true
+    }
+
+    /** Every touch event that reaches the keyboard's top view. */
+    fun treeEvent(e: MotionEvent) {
+        arrivalFor(e)?.tree = true
+    }
+
+    /** A finger landing that the keyboard's own touch code got. */
+    fun handledEvent(e: MotionEvent) {
+        arrivalFor(e)?.handled = true
     }
 
     /** One more line for the report, supplied by the keyboard (the touch model's state). */
@@ -310,6 +366,9 @@ object PerfMonitor {
         offsetLeft.fill(0)
         offsetRight.fill(0)
         notes = 0
+        arrivals.clear()
+        windowCancels = 0
+        accidentalCancels = 0
     }
 
     // ---------- the report ----------
@@ -421,6 +480,24 @@ object PerfMonitor {
         side("right half", offsetRight)
         sb.append('\n')
         extra?.let { sb.append(it()).append('\n') }
+
+        val seenWindow = arrivals.count { it.window }
+        val seenTree = arrivals.count { it.tree }
+        val handled = arrivals.count { it.handled }
+        sb.append("ARRIVALS fingers down: at window ").append(seenWindow).append(" | at keyboard view ").append(seenTree)
+            .append(" | handled ").append(handled).append(" | window cancels ").append(windowCancels)
+            .append(" (phone said accidental ").append(accidentalCancels).append(")\n")
+        sb.append("CONTACT SIZE px: ").append(summary(arrivals.filter { it.handled }.map { it.size })).append('\n')
+        val lost = arrivals.filter { !it.handled }
+        if (lost.isNotEmpty()) {
+            sb.append("NEVER REACHED KEYBOARD CODE (time, key under, seen by window/view, size):\n")
+            for (a in lost.takeLast(40)) {
+                sb.append(String.format("%.2f", (a.timeMs - startedMs) / 1000f)).append(' ')
+                    .append(keyAt?.invoke(a.sx, a.sy) ?: "?").append(' ')
+                    .append(if (a.window) "W" else "-").append(if (a.tree) "V" else "-").append(' ')
+                    .append(a.size.toInt()).append('\n')
+            }
+        }
         sb.append("TOUCHES TAKEN AWAY / NOTES: ").append(notes).append('\n')
         sb.append("TOUCHES (time, D/U/C, key landing%x,y [raw=key under finger] #finger, wait/work ms, slow steps):\n")
         for (e in events.takeLast(360)) {

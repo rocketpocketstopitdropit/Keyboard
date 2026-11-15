@@ -53,7 +53,6 @@ private const val TOUCH_SIGMA = 0.4
 private const val MAX_TOUCH_D2 = 1.0
 private const val PRIOR_FLOOR = 0.02
 private const val TOUCH_PREFS = "touch_model"
-private const val ORDER_DOUBT_MS = 70L
 
 class MyKeyboardIME : InputMethodService() {
 
@@ -145,10 +144,8 @@ class MyKeyboardIME : InputMethodService() {
     private val touchModel = TouchModel()
     private var touchModelId: String? = null
 
-    /** Where the finger landed for each letter of the word being typed (null = not typed by a tap). */
-    private val wordTouches = ArrayList<FloatArray?>()
-    /** When each of those fingers came down (0 = unknown). */
-    private val wordTimes = ArrayList<Long>()
+    /** Where and when the finger landed for each letter of the word being typed. */
+    private val evidence = TouchEvidence(touchModel)
     private var tapX = Float.NaN
     private var tapY = Float.NaN
     private var tapTime = 0L
@@ -169,23 +166,11 @@ class MyKeyboardIME : InputMethodService() {
 
     /** A letter was just added to the word being typed; keep its touch alongside it. */
     private fun noteLetterTouch() {
-        if (currentWord.length <= 1 || wordTouches.size > 48) {
-            wordTouches.clear()
-            wordTimes.clear()
-        }
-        wordTouches.add(if (tapX.isNaN()) null else floatArrayOf(tapX, tapY))
-        wordTimes.add(tapTime)
+        val w = currentWord.toString()
+        evidence.add(w, tapX, tapY, tapTime)
         // Two thumbs landing within a few hundredths of a second: which came first is
         // down to chance, so tell the autocorrector those two letters may be swapped.
-        if (wordTimes.size == currentWord.length) {
-            var pairs = IntArray(0)
-            for (i in 0 until wordTimes.size - 1) {
-                val a = wordTimes[i]
-                val b = wordTimes[i + 1]
-                if (a > 0L && b > 0L && abs(b - a) <= ORDER_DOUBT_MS) pairs += i
-            }
-            Autocorrector.setOrderDoubt(currentWord.toString(), pairs)
-        }
+        Autocorrector.setOrderDoubt(w, evidence.racePairs(w))
     }
 
     /**
@@ -195,15 +180,15 @@ class MyKeyboardIME : InputMethodService() {
      * toward where the finger actually came down.
      */
     private fun learnTouches(finalWord: String) {
-        val typed = currentWord
-        if (learningAllowed && typed.length >= 2 && wordTouches.size == typed.length &&
+        val typed = currentWord.toString()
+        if (learningAllowed && typed.length >= 2 &&
             finalWord.length == typed.length && WordPredictor.isKnown(finalWord)
         ) {
             var changed = 0
             for (i in typed.indices) if (!typed[i].equals(finalWord[i], ignoreCase = true)) changed++
             if (changed <= 2 && changed * 2 <= typed.length) {
                 for (i in typed.indices) {
-                    val touch = wordTouches[i] ?: continue
+                    val touch = evidence.touchAt(typed, i) ?: continue
                     val c = finalWord[i].lowercaseChar()
                     // Two letters that were only swapped round say nothing about where the finger lands.
                     if (c != typed[i].lowercaseChar() && (
@@ -222,35 +207,7 @@ class MyKeyboardIME : InputMethodService() {
                 }
             }
         }
-        wordTouches.clear()
-    }
-
-    /**
-     * For the autocorrector: going by where the finger for letter [position]
-     * of [word] landed, how many times likelier it was aiming at [alt] than at
-     * the letter it typed. Each letter is judged against this person's usual
-     * landing spot for it, the same way the key was picked in the first
-     * place. NaN when there's no touch to go by, or it was nowhere near [alt].
-     */
-    private fun touchOddsFor(word: String, position: Int, alt: Char): Double {
-        if (wordTouches.size != currentWord.length || position < 0 || position >= wordTouches.size) return Double.NaN
-        if (!word.contentEquals(currentWord, ignoreCase = true)) return Double.NaN
-        val touch = wordTouches[position] ?: return Double.NaN
-        val typed = spotDistance2(touch, word[position].lowercaseChar())
-        val other = spotDistance2(touch, alt)
-        if (typed.isNaN() || other.isNaN() || other > 2.25) return Double.NaN
-        return kotlin.math.exp(-(other - typed) / (2.0 * TOUCH_SIGMA * TOUCH_SIGMA))
-    }
-
-    /** Squared distance, in key sizes, from a touch to where the finger usually lands for [letter]. */
-    private fun spotDistance2(touch: FloatArray, letter: Char): Double {
-        val lr = letterRects.firstOrNull { it.letter == letter } ?: return Double.NaN
-        val w = lr.rect.width()
-        val h = lr.rect.height()
-        if (w <= 0 || h <= 0) return Double.NaN
-        val dx = (touch[0] - lr.rect.exactCenterX()) / w - touchModel.offsetX(letter)
-        val dy = (touch[1] - lr.rect.exactCenterY()) / h - touchModel.offsetY(letter)
-        return (dx * dx + dy * dy).toDouble()
+        evidence.clear()
     }
 
     /** Loads the landing spots learned for this layout and screen width; unlearned keys get a starting guess. */
@@ -262,6 +219,9 @@ class MyKeyboardIME : InputMethodService() {
             touchModel.load(getSharedPreferences(TOUCH_PREFS, MODE_PRIVATE).getString(id, null))
             touchModelId = id
         }
+        evidence.setKeys(letters.map {
+            LetterKey(it.letter, it.rect.exactCenterX(), it.rect.exactCenterY(), it.rect.width().toFloat(), it.rect.height().toFloat())
+        })
         // The starting guess was measured on a phone-width keyboard; wider ones learn from scratch.
         if (widthDp >= 600 || letters.isEmpty() || root.width <= 0) return
         val rowYs = ArrayList<Float>()
@@ -360,7 +320,7 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.addPrimaryClipChangedListener(clipListener)
         // The autocorrect search runs in the background; fill in the bar when it lands.
         Autocorrector.onReady = { if (currentWord.isNotEmpty()) PerfMonitor.span("barRefresh") { updateSuggestions() } }
-        Autocorrector.touchOdds = { word, position, alt -> touchOddsFor(word, position, alt) }
+        Autocorrector.touch = evidence
         PerfMonitor.extra = {
             "TOUCH MODEL " + (touchModelId ?: "-") + " (letter dx,dy % of key / touches learned):" + touchModel.describe()
         }
@@ -371,7 +331,7 @@ class MyKeyboardIME : InputMethodService() {
         clipboardManager.removePrimaryClipChangedListener(clipListener)
         speechRecognizer?.destroy()
         Autocorrector.onReady = null
-        Autocorrector.touchOdds = null
+        Autocorrector.touch = null
         PerfMonitor.extra = null
     }
 
@@ -395,7 +355,13 @@ class MyKeyboardIME : InputMethodService() {
     }
 
     override fun onCreateInputView(): View {
-        keyboardContainer = FrameLayout(this)
+        keyboardContainer = object : FrameLayout(this) {
+            // The typing monitor notes every touch that reaches the keyboard at all.
+            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+                PerfMonitor.treeEvent(ev)
+                return super.dispatchTouchEvent(ev)
+            }
+        }
         populateKeyboard()
         return keyboardContainer
     }
@@ -1394,10 +1360,12 @@ class MyKeyboardIME : InputMethodService() {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
                 PerfMonitor.begin('D', event.eventTime)
+                PerfMonitor.handledEvent(event)
                 pointerDown(event.getPointerId(i), event.getX(i), event.getY(i))
                 PerfMonitor.detail(
                     "#" + event.getPointerId(i) +
-                        (if (event.actionMasked == MotionEvent.ACTION_DOWN) "" else "+") + "/" + event.pointerCount
+                        (if (event.actionMasked == MotionEvent.ACTION_DOWN) "" else "+") + "/" + event.pointerCount +
+                        " s" + event.getTouchMajor(i).toInt()
                 )
                 PerfMonitor.end()
             }
@@ -1420,6 +1388,8 @@ class MyKeyboardIME : InputMethodService() {
                 PerfMonitor.end()
             }
             MotionEvent.ACTION_CANCEL -> {
+                // 0x20 = FLAG_CANCELED: the phone itself judged the touch accidental.
+                if (event.flags and 0x20 != 0) PerfMonitor.note('C', "phone called it accidental")
                 rescueCancelledTouches()
                 cancelAllTouches()
             }
@@ -1474,6 +1444,39 @@ class MyKeyboardIME : InputMethodService() {
             PerfMonitor.offset(x > (builtRoot?.width ?: 0) / 2f, dx, dy, moved)
         }
         return " " + dx + "," + dy + (if (moved) " raw=" + monitorLabel(raw) else "")
+    }
+
+    /** Lets the typing monitor see every touch the keyboard's window gets, before any view does. */
+    private fun watchWindowTouches() {
+        val w = window?.window ?: return
+        val cb = w.callback ?: return
+        if (cb is WindowTouchSpy) return
+        try {
+            w.callback = WindowTouchSpy(cb)
+        } catch (e: Exception) {
+            // Without it the report just can't tell "never reached the window" from "never reached the keyboard".
+        }
+        PerfMonitor.keyAt = { sx, sy -> keyAtScreen(sx, sy) }
+    }
+
+    private class WindowTouchSpy(private val inner: android.view.Window.Callback) : android.view.Window.Callback by inner {
+        override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+            PerfMonitor.windowEvent(event)
+            return inner.dispatchTouchEvent(event)
+        }
+    }
+
+    /** For the typing monitor: the key under a point on the screen, with no guessing. */
+    private fun keyAtScreen(sx: Float, sy: Float): String {
+        val root = builtRoot ?: return "?"
+        val loc = IntArray(2)
+        root.getLocationOnScreen(loc)
+        val x = (sx - loc[0]).toInt()
+        val y = (sy - loc[1]).toInt()
+        if (x < 0 || y < 0 || x >= root.width || y >= root.height) return "outside"
+        val rects = keyRects ?: return "?"
+        for (e in rects) if (e.rect.contains(x, y)) return monitorLabel(e.key)
+        return "gap"
     }
 
     /** What the typing monitor calls a key. Nothing is named in boxes the keyboard doesn't learn from (passwords). */
@@ -1885,8 +1888,7 @@ class MyKeyboardIME : InputMethodService() {
                 } else {
                     ic.deleteSurroundingText(1, 0)
                     if (currentWord.isNotEmpty()) currentWord.deleteCharAt(currentWord.length - 1)
-                    if (wordTouches.isNotEmpty()) wordTouches.removeAt(wordTouches.size - 1)
-                    if (wordTimes.isNotEmpty()) wordTimes.removeAt(wordTimes.size - 1)
+                    evidence.removeLast(currentWord.toString())
                 }
                 // Backing into the word before (or out of one): read it back from the text,
                 // so predictions use exactly the letters between the last space and the cursor.
@@ -2736,6 +2738,7 @@ class MyKeyboardIME : InputMethodService() {
         refreshLetterPrior()
         updateSuggestions()
         PerfMonitor.start(window?.window)
+        watchWindowTouches()
     }
 
     override fun onUpdateSelection(
